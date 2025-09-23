@@ -1,0 +1,40 @@
+# Variables de entorno (IMPORTANTE - contiene credenciales)
+.env
+.env.local
+
+# Carpetas de datos
+raw/
+processed/
+logs/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+.Python
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Archivos de respaldo
+*.bak
+*.backup
+*.tmp
+~$*
+
+# Archivos de Excel temporales
+~$*.xlsx
+~$*.xls
