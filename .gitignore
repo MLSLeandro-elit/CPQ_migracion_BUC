@@ -7,6 +7,10 @@ raw/
 processed/
 logs/
 
+
+# Versiones antiguas
+old/
+
 # Python
 __pycache__/
 *.py[cod]
