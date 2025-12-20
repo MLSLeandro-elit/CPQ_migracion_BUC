@@ -1,25 +1,33 @@
 """Script para procesar archivos aplicando reemplazos de caracteres,
 validar estructura de columnas y subirlos por FTP al servidor AS400.
-Versión 8: Con soporte para comodín y rechazo de archivos no parametrizados.
+
+Versión 11: Renombrado por posición, fechas numéricas, CONSERVAR_ENTRADA.
+- entrada_xlsx/  → Usuario coloca archivos .xlsx aquí
+- entrada_csv/   → Usuario coloca archivos .csv aquí
+- salida/        → Archivos procesados listos para FTP
+- logs/          → Registro detallado de cada ejecución
 """
 
 import os
 import json
 import logging
+import shutil
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple, Optional, Any
 from ftplib import FTP
 from pathlib import Path
 from datetime import datetime
 from dotenv import load_dotenv
+
+# Para conversión de Excel
+import pandas as pd
 
 
 # =============================================================================
 # CARGA DE CONFIGURACIÓN EXTERNA
 # =============================================================================
 
-# Cargar variables de entorno desde .env
 load_dotenv()
 
 
@@ -35,14 +43,14 @@ class FTPConfig:
 @dataclass
 class ProcessConfig:
     """Configuración de procesamiento desde variables de entorno"""
-    carpeta_origen: str = os.getenv('CARPETA_ORIGEN', 'raw')
-    carpeta_destino: str = os.getenv('CARPETA_DESTINO', 'processed')
+    carpeta_entrada_xlsx: str = os.getenv('CARPETA_ENTRADA_XLSX', 'entrada_xlsx')
+    carpeta_entrada_csv: str = os.getenv('CARPETA_ENTRADA_CSV', 'entrada_csv')
+    carpeta_salida: str = os.getenv('CARPETA_SALIDA', 'salida')
     carpeta_logs: str = os.getenv('CARPETA_LOGS', 'logs')
-    archivo_esquemas: str = os.getenv(
-        'ARCHIVO_ESQUEMAS', 'config/esquemas.json')
-    archivo_reemplazos: str = os.getenv(
-        'ARCHIVO_REEMPLAZOS', 'config/reemplazos.json')
+    archivo_esquemas: str = os.getenv('ARCHIVO_ESQUEMAS', 'config/esquemas.json')
+    archivo_reemplazos: str = os.getenv('ARCHIVO_REEMPLAZOS', 'config/reemplazos.json')
     separador_salida: str = os.getenv('SEPARADOR_SALIDA', '|')
+    conservar_entrada: bool = os.getenv('CONSERVAR_ENTRADA', 'false').lower() == 'true'
 
     def cargar_reemplazos(self) -> List[Tuple[str, str]]:
         """Carga los reemplazos desde archivo JSON o usa valores por defecto"""
@@ -73,6 +81,91 @@ class ProcessConfig:
 
 
 # =============================================================================
+# CARGADOR DE ESQUEMAS
+# =============================================================================
+
+class SchemaLoader:
+    """Carga y gestiona esquemas de archivos"""
+
+    def __init__(self, archivo_esquemas: str):
+        self.archivo_esquemas = archivo_esquemas
+        self.esquemas = self._cargar_esquemas()
+
+    def _cargar_esquemas(self) -> Dict[str, Any]:
+        """Carga esquemas desde archivo JSON"""
+        try:
+            with open(self.archivo_esquemas, 'r', encoding='utf-8') as f:
+                esquemas = json.load(f)
+                print(f"[CONFIG] Esquemas cargados desde {self.archivo_esquemas}")
+                print(f"[CONFIG] Tipos de archivo configurados: {', '.join(esquemas.keys())}")
+                return esquemas
+        except FileNotFoundError:
+            print(f"[WARN] Archivo {self.archivo_esquemas} no encontrado")
+            print("[WARN] Continuando sin validación de columnas")
+            return {}
+        except json.JSONDecodeError as e:
+            print(f"[ERROR] Error al parsear {self.archivo_esquemas}: {e}")
+            print("[WARN] Continuando sin validación de columnas")
+            return {}
+
+    def obtener_tipo_archivo(self, nombre_archivo: str) -> Optional[str]:
+        """Determina el tipo de archivo basado en el nombre"""
+        nombre_base = Path(nombre_archivo).stem
+        for tipo in self.esquemas.keys():
+            if nombre_base.startswith(tipo):
+                return tipo
+        return None
+
+    def obtener_columnas(self, tipo_archivo: str) -> List[str]:
+        """Obtiene lista de columnas para un tipo de archivo"""
+        if tipo_archivo not in self.esquemas:
+            return []
+
+        esquema = self.esquemas[tipo_archivo]
+
+        # Soportar formato nuevo (objeto) y viejo (array)
+        if isinstance(esquema, dict):
+            return esquema.get('columnas', [])
+        elif isinstance(esquema, list):
+            return esquema
+        return []
+
+    def obtener_fechas_numericas(self, tipo_archivo: str) -> List[str]:
+        """Obtiene lista de columnas que son fechas numéricas"""
+        if tipo_archivo not in self.esquemas:
+            return []
+
+        esquema = self.esquemas[tipo_archivo]
+
+        if isinstance(esquema, dict):
+            return esquema.get('fechas_numericas', [])
+        return []
+
+    def tiene_comodin(self, tipo_archivo: str) -> bool:
+        """Verifica si el esquema tiene comodín (*)"""
+        columnas = self.obtener_columnas(tipo_archivo)
+        return '*' in columnas
+
+    def columnas_obligatorias(self, tipo_archivo: str) -> List[str]:
+        """Obtiene columnas obligatorias (sin el comodín)"""
+        columnas = self.obtener_columnas(tipo_archivo)
+        if '*' in columnas:
+            return columnas[:columnas.index('*')]
+        return columnas
+
+    def obtener_filas_omitir(self, tipo_archivo: str) -> List[int]:
+        """Obtiene lista de filas a omitir (numeración desde 1)"""
+        if tipo_archivo not in self.esquemas:
+            return []
+
+        esquema = self.esquemas[tipo_archivo]
+
+        if isinstance(esquema, dict):
+            return esquema.get('filas_omitir', [])
+        return []
+
+
+# =============================================================================
 # SISTEMA DE LOGGING
 # =============================================================================
 
@@ -83,24 +176,21 @@ class MigrationLogger:
         self.carpeta_logs = carpeta_logs
         os.makedirs(carpeta_logs, exist_ok=True)
 
-        # Crear nombre de archivo con timestamp
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.archivo_log = os.path.join(
-            carpeta_logs, f"migracion_{timestamp}.log")
+        self.archivo_log = os.path.join(carpeta_logs, f"migracion_{timestamp}.log")
 
-        # Configurar logger
         self.logger = logging.getLogger('MigrationLogger')
         self.logger.setLevel(logging.DEBUG)
 
-        # Handler para archivo
+        # Limpiar handlers anteriores
+        self.logger.handlers = []
+
         file_handler = logging.FileHandler(self.archivo_log, encoding='utf-8')
         file_handler.setLevel(logging.DEBUG)
 
-        # Handler para consola
         console_handler = logging.StreamHandler()
         console_handler.setLevel(logging.INFO)
 
-        # Formato simple (el formato visual lo manejamos nosotros)
         formatter = logging.Formatter('%(message)s')
         file_handler.setFormatter(formatter)
         console_handler.setFormatter(formatter)
@@ -109,66 +199,74 @@ class MigrationLogger:
         self.logger.addHandler(console_handler)
 
         # Listas para el resumen
+        self.archivos_convertidos = []
+        self.archivos_conversion_error = []
         self.archivos_procesados = []
         self.archivos_con_error = []
         self.archivos_ftp_ok = []
         self.archivos_ftp_error = []
 
     def linea_separadora(self, char='=', length=80):
-        """Genera una línea separadora"""
         return char * length
 
     def log(self, mensaje: str):
-        """Log simple"""
         self.logger.info(mensaje)
 
     def inicio_proceso(self):
-        """Log de inicio del proceso completo"""
         self.log(self.linea_separadora('='))
-        self.log(
-            f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - INICIO PROCESO DE MIGRACIÓN")
+        self.log(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - INICIO PROCESO DE MIGRACIÓN")
         self.log(self.linea_separadora('='))
 
-    def inicio_archivo(self, nombre_archivo: str):
-        """Log de inicio de procesamiento de archivo"""
+    def inicio_conversion(self):
         self.log("")
         self.log(self.linea_separadora('-'))
+        self.log("FASE 1: CONVERSIÓN XLSX → CSV")
+        self.log(self.linea_separadora('-'))
+
+    def fin_conversion(self):
+        total = len(self.archivos_convertidos) + len(self.archivos_conversion_error)
+        self.log("")
+        self.log(f"[CONVERSIÓN] Resumen:")
+        self.log(f"  - Total archivos .xlsx: {total}")
+        self.log(f"  - Convertidos: {len(self.archivos_convertidos)}")
+        self.log(f"  - Con errores: {len(self.archivos_conversion_error)}")
+        self.log(self.linea_separadora('-'))
+
+    def inicio_procesamiento(self):
+        self.log("")
+        self.log(self.linea_separadora('-'))
+        self.log("FASE 2: VALIDACIÓN Y PROCESAMIENTO CSV")
+        self.log(self.linea_separadora('-'))
+
+    def inicio_archivo(self, nombre_archivo: str):
+        self.log("")
         self.log(f"ARCHIVO: {nombre_archivo}")
         self.log(f"INICIO: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        self.log(self.linea_separadora('-'))
 
     def fin_archivo(self, nombre_archivo: str, exitoso: bool):
-        """Log de fin de procesamiento de archivo"""
         if exitoso:
-            self.log("\n[RESULTADO] ARCHIVO PROCESADO EXITOSAMENTE")
+            self.log("[RESULTADO] ARCHIVO PROCESADO EXITOSAMENTE")
             self.archivos_procesados.append(nombre_archivo)
         else:
-            self.log("\n[RESULTADO] ARCHIVO RECHAZADO - No procesado")
+            self.log("[RESULTADO] ARCHIVO RECHAZADO - No procesado")
             self.archivos_con_error.append(nombre_archivo)
 
-        self.log(self.linea_separadora('-'))
-        self.log(
-            f"FIN: {nombre_archivo} - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        self.log(self.linea_separadora('-'))
-
     def error_validacion(self, esperadas: int, encontradas: int, diferencias: List[str]):
-        """Log de errores de validación"""
         self.log("[ERROR] Validación de columnas fallida")
         self.log(f"  - Columnas esperadas: {esperadas}")
         self.log(f"  - Columnas encontradas: {encontradas}")
 
         if diferencias:
             self.log("\n[ERROR] Diferencias encontradas:")
-            for diff in diferencias[:10]:  # Máximo 10 diferencias
+            for diff in diferencias[:10]:
                 self.log(f"  - {diff}")
             if len(diferencias) > 10:
                 self.log(f"  ... y {len(diferencias) - 10} diferencias más")
 
     def inicio_ftp(self, config: FTPConfig):
-        """Log de inicio de proceso FTP"""
         self.log("")
         self.log(self.linea_separadora('='))
-        self.log("PROCESO FTP - SUBIDA AL SERVIDOR AS400")
+        self.log("FASE 3: SUBIDA FTP AL SERVIDOR AS400")
         self.log(self.linea_separadora('='))
         self.log(f"INICIO: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         self.log(f"Host: {config.host}")
@@ -177,51 +275,58 @@ class MigrationLogger:
         self.log(self.linea_separadora('-'))
 
     def fin_ftp(self, exitoso: bool):
-        """Log de fin de proceso FTP"""
         if exitoso:
             self.log(f"\n[FTP] Resumen de subida:")
-            self.log(
-                f"  - Total archivos: {len(self.archivos_ftp_ok) + len(self.archivos_ftp_error)}")
+            self.log(f"  - Total archivos: {len(self.archivos_ftp_ok) + len(self.archivos_ftp_error)}")
             self.log(f"  - Exitosos: {len(self.archivos_ftp_ok)}")
             self.log(f"  - Fallidos: {len(self.archivos_ftp_error)}")
             self.log("\n[FTP] Conexión cerrada correctamente")
         else:
-            self.log(
-                "\n[RESULTADO] SUBIDA FTP FALLIDA - Archivos no subidos al servidor")
-            self.log("  Los archivos procesados están disponibles en: processed/")
+            self.log("\n[RESULTADO] SUBIDA FTP FALLIDA")
+            self.log("  Los archivos procesados están disponibles en: salida/")
 
         self.log(self.linea_separadora('-'))
-        self.log(
-            f"FIN PROCESO FTP: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        self.log(f"FIN PROCESO FTP: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         self.log(self.linea_separadora('='))
 
-    def resumen_final(self, separador_entrada: str, separador_salida: str):
-        """Log del resumen final"""
+    def resumen_final(self, tipo_entrada: str, separador_csv: str, separador_salida: str, conservar_entrada: bool):
         self.log("")
         self.log(self.linea_separadora('='))
-        self.log(
-            f"RESUMEN FINAL - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        self.log(f"RESUMEN FINAL - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         self.log(self.linea_separadora('='))
 
-        self.log("PROCESAMIENTO LOCAL:")
-        total = len(self.archivos_procesados) + len(self.archivos_con_error)
-        self.log(f"  Total archivos encontrados: {total}")
+        self.log(f"\nTipo de entrada: {tipo_entrada}")
 
+        if tipo_entrada == 'xlsx':
+            self.log("\nFASE 1 - CONVERSIÓN XLSX → CSV:")
+            total_xlsx = len(self.archivos_convertidos) + len(self.archivos_conversion_error)
+            self.log(f"  Total archivos .xlsx: {total_xlsx}")
+            self.log(f"  Convertidos exitosamente: {len(self.archivos_convertidos)}")
+            for archivo in self.archivos_convertidos:
+                self.log(f"    ✓ {archivo}")
+            self.log(f"  Con errores (permanecen en entrada_xlsx/): {len(self.archivos_conversion_error)}")
+            for archivo in self.archivos_conversion_error:
+                self.log(f"    ✗ {archivo}")
+
+        self.log("\nFASE 2 - PROCESAMIENTO CSV:")
+        total_csv = len(self.archivos_procesados) + len(self.archivos_con_error)
+        self.log(f"  Total archivos CSV: {total_csv}")
         self.log(f"  Procesados exitosamente: {len(self.archivos_procesados)}")
         for archivo in self.archivos_procesados:
             self.log(f"    ✓ {archivo}")
 
-        self.log(
-            f"  Con errores (no procesados): {len(self.archivos_con_error)}")
+        carpeta_error = "entrada_xlsx/" if tipo_entrada == 'xlsx' else "entrada_csv/"
+        self.log(f"  Con errores (permanecen en {carpeta_error}): {len(self.archivos_con_error)}")
         for archivo in self.archivos_con_error:
-            self.log(f"    ✗ {archivo} - Error en validación de columnas")
+            self.log(f"    ✗ {archivo}")
 
-        self.log("\nSUBIDA FTP:")
+        self.log("\nFASE 3 - SUBIDA FTP:")
         self.log(f"  Archivos subidos: {len(self.archivos_ftp_ok)}")
         self.log(f"  Errores de subida: {len(self.archivos_ftp_error)}")
 
-        self.log(f"\nSeparador entrada usado: {repr(separador_entrada)}")
-        self.log(f"Separador salida usado: {repr(separador_salida)}")
+        self.log(f"\nSeparador CSV usado: {repr(separador_csv)}")
+        self.log(f"Separador salida: {repr(separador_salida)}")
+        self.log(f"Conservar entrada: {'Sí' if conservar_entrada else 'No'}")
 
         self.log(f"\nLog guardado en: {self.archivo_log}")
         self.log(self.linea_separadora('='))
@@ -232,46 +337,242 @@ class MigrationLogger:
 # =============================================================================
 
 class IValidator(ABC):
-    """Interface para validadores"""
     @abstractmethod
     def validar(self, archivo: str, contenido: str, logger: MigrationLogger) -> Tuple[bool, Optional[str]]:
-        """Valida el contenido del archivo.
-        Returns: (es_valido, mensaje_error)
-        """
         pass
 
 
 class IProcessor(ABC):
-    """Interface para procesadores de texto"""
     @abstractmethod
     def procesar(self, contenido: str, separador_entrada: str, separador_salida: str) -> Tuple[str, int]:
-        """Procesa el contenido del archivo.
-        Returns: (contenido_procesado, numero_de_reemplazos)
-        """
         pass
 
 
 class IFileHandler(ABC):
-    """Interface para manejadores de archivos"""
     @abstractmethod
     def leer(self, ruta: str, logger: MigrationLogger) -> str:
-        """Lee un archivo"""
         pass
 
     @abstractmethod
     def escribir(self, ruta: str, contenido: str) -> None:
-        """Escribe un archivo"""
         pass
 
 
 class IUploader(ABC):
-    """Interface para cargadores"""
     @abstractmethod
     def subir(self, carpeta_local: str, logger: MigrationLogger) -> bool:
-        """Sube archivos a destino.
-        Returns: True si exitoso, False si falló
-        """
         pass
+
+
+# =============================================================================
+# CONVERSOR XLSX A CSV
+# =============================================================================
+
+class ExcelConverter:
+    """Convierte archivos Excel (.xlsx) a CSV con renombrado de columnas y fechas numéricas."""
+
+    def __init__(self, schema_loader: SchemaLoader, separador: str = ';'):
+        self.schema_loader = schema_loader
+        self.separador = separador
+
+    def _formatear_entero(self, valor) -> str:
+        """Convierte floats que son enteros a string sin .0"""
+        if pd.isna(valor):
+            return ''
+        
+        # Si es float y no tiene decimales reales, quitar .0
+        if isinstance(valor, float):
+            if valor == int(valor):
+                return str(int(valor))
+            return str(valor)
+        
+        return str(valor) if not isinstance(valor, str) else valor
+
+    def _formatear_fecha_numerica(self, valor) -> str:
+        """Convierte un valor de fecha a formato YYYYMMDD"""
+        if pd.isna(valor):
+            return ''
+        
+        # Si ya es string numérico, retornar como está
+        if isinstance(valor, str):
+            # Limpiar espacios
+            valor = valor.strip()
+            # Si ya está en formato numérico (solo dígitos)
+            if valor.isdigit() and len(valor) == 8:
+                return valor
+            # Si tiene formato fecha con separadores, intentar parsear
+            try:
+                fecha = pd.to_datetime(valor)
+                return fecha.strftime('%Y%m%d')
+            except:
+                return valor
+        
+        # Si es un número (Excel guarda fechas como números)
+        if isinstance(valor, (int, float)):
+            # Si es un número de 8 dígitos, probablemente ya es YYYYMMDD
+            if 10000101 <= valor <= 99991231:
+                return str(int(valor))
+            # Si no, intentar convertir desde número de serie de Excel
+            try:
+                fecha = pd.to_datetime(valor, unit='D', origin='1899-12-30')
+                return fecha.strftime('%Y%m%d')
+            except:
+                return str(int(valor)) if valor == int(valor) else str(valor)
+        
+        # Si es datetime
+        if isinstance(valor, (pd.Timestamp, datetime)):
+            return valor.strftime('%Y%m%d')
+        
+        return str(valor)
+
+    def convertir(self, ruta_xlsx: str, ruta_csv: str, logger: MigrationLogger) -> bool:
+        """
+        Convierte un archivo XLSX a CSV.
+        - Renombra columnas según esquema (por posición)
+        - Convierte fechas numéricas a formato YYYYMMDD
+        
+        Returns:
+            True si la conversión fue exitosa
+        """
+        nombre = os.path.basename(ruta_xlsx)
+
+        try:
+            # Obtener tipo de archivo y esquema ANTES de leer
+            tipo_archivo = self.schema_loader.obtener_tipo_archivo(nombre)
+            filas_omitir = []
+            
+            if tipo_archivo:
+                filas_omitir = self.schema_loader.obtener_filas_omitir(tipo_archivo)
+            
+            # Leer Excel SIN header (todas las filas como datos)
+            df = pd.read_excel(ruta_xlsx, engine='openpyxl', header=None)
+
+            if df.empty:
+                logger.log(f"  [ERROR] Archivo vacío: {nombre}")
+                return False
+
+            # Eliminar filas a omitir PRIMERO (numeración desde 1, índice desde 0)
+            if filas_omitir:
+                indices_a_eliminar = [f - 1 for f in filas_omitir]  # Fila 1 = índice 0
+                indices_validos = [i for i in indices_a_eliminar if 0 <= i < len(df)]
+                
+                if indices_validos:
+                    df = df.drop(df.index[indices_validos]).reset_index(drop=True)
+                    logger.log(f"  [OK] Filas omitidas: {filas_omitir} ({len(indices_validos)} filas eliminadas)")
+
+            # Ahora la primera fila es el encabezado
+            df.columns = df.iloc[0]  # Primera fila como nombres de columnas
+            df = df.iloc[1:].reset_index(drop=True)  # Resto como datos
+
+            if tipo_archivo:
+                columnas_esquema = self.schema_loader.columnas_obligatorias(tipo_archivo)
+                fechas_numericas = self.schema_loader.obtener_fechas_numericas(tipo_archivo)
+                tiene_comodin = self.schema_loader.tiene_comodin(tipo_archivo)
+
+                # Validar cantidad de columnas
+                num_columnas_excel = len(df.columns)
+                num_columnas_esquema = len(columnas_esquema)
+
+                if tiene_comodin:
+                    if num_columnas_excel < num_columnas_esquema:
+                        logger.log(f"  [ERROR] {nombre}: Columnas insuficientes")
+                        logger.log(f"          Excel tiene {num_columnas_excel}, esquema requiere mínimo {num_columnas_esquema}")
+                        return False
+                else:
+                    if num_columnas_excel != num_columnas_esquema:
+                        logger.log(f"  [ERROR] {nombre}: Cantidad de columnas no coincide")
+                        logger.log(f"          Excel tiene {num_columnas_excel}, esquema requiere {num_columnas_esquema}")
+                        return False
+
+                # Renombrar columnas por posición
+                nuevos_nombres = []
+                for i in range(num_columnas_excel):
+                    if i < num_columnas_esquema:
+                        nuevos_nombres.append(columnas_esquema[i])
+                    else:
+                        # Columnas extra (después del comodín) - mantener nombre original
+                        nuevos_nombres.append(df.columns[i])
+
+                df.columns = nuevos_nombres
+                logger.log(f"  [OK] Columnas renombradas según esquema ({num_columnas_esquema} columnas)")
+
+                # Convertir fechas numéricas
+                if fechas_numericas:
+                    fechas_convertidas = 0
+                    for col in fechas_numericas:
+                        if col in df.columns:
+                            df[col] = df[col].apply(self._formatear_fecha_numerica)
+                            fechas_convertidas += 1
+                    if fechas_convertidas > 0:
+                        logger.log(f"  [OK] Fechas convertidas a YYYYMMDD ({fechas_convertidas} columnas)")
+
+                # Quitar .0 de columnas numéricas (que no son fechas)
+                columnas_no_fecha = [col for col in df.columns if col not in fechas_numericas]
+                for col in columnas_no_fecha:
+                    df[col] = df[col].apply(self._formatear_entero)
+                logger.log(f"  [OK] Valores numéricos formateados (sin .0)")
+
+            else:
+                logger.log(f"  [WARN] {nombre}: Sin esquema definido, usando nombres originales")
+                # Quitar .0 de columnas numéricas aunque no haya esquema
+                for col in df.columns:
+                    df[col] = df[col].apply(self._formatear_entero)
+
+            # Guardar CSV
+            df.to_csv(ruta_csv, sep=self.separador, index=False, encoding='utf-8')
+
+            filas = len(df)
+            columnas = len(df.columns)
+            logger.log(f"  [OK] {nombre} → {os.path.basename(ruta_csv)} ({filas} filas, {columnas} columnas)")
+
+            return True
+
+        except Exception as e:
+            logger.log(f"  [ERROR] {nombre}: {str(e)}")
+            return False
+
+    def convertir_carpeta(self, carpeta_entrada: str, carpeta_temporal: str,
+                          logger: MigrationLogger) -> Tuple[List[str], List[str]]:
+        """
+        Convierte todos los archivos XLSX de una carpeta.
+        
+        Returns:
+            Tupla (archivos_csv_generados, archivos_xlsx_exitosos)
+        """
+        logger.inicio_conversion()
+
+        os.makedirs(carpeta_temporal, exist_ok=True)
+
+        # Ignorar archivos temporales de Excel (~$)
+        archivos_xlsx = [f for f in os.listdir(carpeta_entrada)
+                         if f.lower().endswith('.xlsx') and not f.startswith('~$')]
+
+        if not archivos_xlsx:
+            logger.log("[INFO] No hay archivos .xlsx en entrada_xlsx/")
+            logger.fin_conversion()
+            return [], []
+
+        logger.log(f"[INFO] Encontrados {len(archivos_xlsx)} archivos .xlsx")
+        logger.log("")
+
+        archivos_csv = []
+        archivos_xlsx_exitosos = []
+
+        for archivo_xlsx in archivos_xlsx:
+            ruta_xlsx = os.path.join(carpeta_entrada, archivo_xlsx)
+            nombre_csv = archivo_xlsx.rsplit('.', 1)[0] + '.csv'
+            ruta_csv = os.path.join(carpeta_temporal, nombre_csv)
+
+            if self.convertir(ruta_xlsx, ruta_csv, logger):
+                archivos_csv.append(nombre_csv)
+                archivos_xlsx_exitosos.append(archivo_xlsx)
+                logger.archivos_convertidos.append(archivo_xlsx)
+            else:
+                logger.archivos_conversion_error.append(archivo_xlsx)
+                logger.log(f"       {archivo_xlsx} permanece en entrada_xlsx/ (revisar error)")
+
+        logger.fin_conversion()
+        return archivos_csv, archivos_xlsx_exitosos
 
 
 # =============================================================================
@@ -279,63 +580,30 @@ class IUploader(ABC):
 # =============================================================================
 
 class ColumnValidator(IValidator):
-    """Validador de columnas para archivos CSV/delimitados con soporte para comodín"""
+    """Validador de columnas para archivos CSV/delimitados"""
 
-    def __init__(self, archivo_esquemas: str, separador: str = '|'):
+    def __init__(self, schema_loader: SchemaLoader, separador: str = ';'):
         self.separador = separador
-        self.esquemas = self._cargar_esquemas(archivo_esquemas)
-
-    def _cargar_esquemas(self, archivo_esquemas: str) -> Dict[str, List[str]]:
-        """Carga esquemas desde archivo JSON"""
-        try:
-            with open(archivo_esquemas, 'r', encoding='utf-8') as f:
-                esquemas = json.load(f)
-                print(f"[CONFIG] Esquemas cargados desde {archivo_esquemas}")
-                print(
-                    f"[CONFIG] Tipos de archivo configurados: {', '.join(esquemas.keys())}")
-                return esquemas
-        except FileNotFoundError:
-            print(f"[WARN] Archivo {archivo_esquemas} no encontrado")
-            print("[WARN] Continuando sin validación de columnas")
-            return {}
-        except json.JSONDecodeError as e:
-            print(f"[ERROR] Error al parsear {archivo_esquemas}: {e}")
-            print("[WARN] Continuando sin validación de columnas")
-            return {}
-
-    def obtener_tipo_archivo(self, nombre_archivo: str) -> Optional[str]:
-        """Extrae el tipo de archivo del nombre (sin extensión)"""
-        nombre_base = Path(nombre_archivo).stem
-        for tipo in self.esquemas.keys():
-            if nombre_base.startswith(tipo):
-                return tipo
-        return None
+        self.schema_loader = schema_loader
 
     def validar(self, archivo: str, contenido: str, logger: MigrationLogger) -> Tuple[bool, Optional[str]]:
-        """Valida que las columnas del archivo coincidan con el esquema esperado.
-        Soporta comodín '*' para permitir columnas adicionales al final.
-        """
-        if not self.esquemas:
-            logger.log(
-                "[INFO] No hay esquemas definidos - Continuando sin validación")
+        if not self.schema_loader.esquemas:
+            logger.log("[INFO] No hay esquemas definidos - Continuando sin validación")
             return True, None
 
-        tipo_archivo = self.obtener_tipo_archivo(archivo)
+        tipo_archivo = self.schema_loader.obtener_tipo_archivo(archivo)
 
-        # Rechazar archivos no parametrizados
         if tipo_archivo is None:
             logger.log("[ERROR] Archivo no parametrizado en esquemas")
-            logger.log(
-                f"  - No existe configuración para archivos tipo '{Path(archivo).stem}'")
+            logger.log(f"  - No existe configuración para archivos tipo '{Path(archivo).stem}'")
             return False, "Archivo no configurado en esquemas"
 
-        columnas_esquema = self.esquemas.get(tipo_archivo)
+        columnas_esquema = self.schema_loader.columnas_obligatorias(tipo_archivo)
         if not columnas_esquema:
             return True, None
 
-        # Verificar integridad del contenido (no caracteres corruptos)
-        caracteres_corruptos = ['�', '\ufffd', 'ï¿½',
-                                'Ã­', 'Ã±', 'Ã¡', 'Ã©', 'Ã³', 'Ãº']
+        # Verificar integridad del contenido
+        caracteres_corruptos = ['�', '\ufffd', 'ï¿½', 'Ã­', 'Ã±', 'Ã¡', 'Ã©', 'Ã³', 'Ãº']
 
         for caracter in caracteres_corruptos:
             if caracter in contenido:
@@ -343,14 +611,7 @@ class ColumnValidator(IValidator):
                 logger.log(f"  - Se detectó: '{caracter}' en el contenido")
                 return False, "Archivo corrupto - debe ser regenerado"
 
-        # Detectar si hay comodín
-        tiene_comodin = False
-        columnas_obligatorias = columnas_esquema
-
-        if "*" in columnas_esquema:
-            tiene_comodin = True
-            indice_comodin = columnas_esquema.index("*")
-            columnas_obligatorias = columnas_esquema[:indice_comodin]
+        tiene_comodin = self.schema_loader.tiene_comodin(tipo_archivo)
 
         try:
             lineas = contenido.strip().split('\n')
@@ -358,167 +619,64 @@ class ColumnValidator(IValidator):
                 logger.log("[ERROR] Archivo vacío")
                 return False, "Archivo vacío"
 
-            # Primera línea = headers
             headers = lineas[0].split(self.separador)
             headers = [h.strip() for h in headers]
 
             logger.log("[OK] Validación de columnas iniciada")
 
-            cantidad_obligatorias = len(columnas_obligatorias)
+            cantidad_obligatorias = len(columnas_esquema)
             cantidad_encontrada = len(headers)
 
-            # CAMBIO 3: Validación diferenciada con/sin comodín
             if tiene_comodin:
-                # Validación CON comodín
                 if cantidad_encontrada < cantidad_obligatorias:
                     logger.log(f"\n[ERROR] Columnas insuficientes")
-                    logger.log(
-                        f"  - Columnas obligatorias requeridas: {cantidad_obligatorias}")
-                    logger.log(
-                        f"  - Columnas recibidas: {cantidad_encontrada}")
-                    logger.log(
-                        f"  - Faltan {cantidad_obligatorias - cantidad_encontrada} columna(s) obligatoria(s)")
+                    logger.log(f"  - Columnas obligatorias requeridas: {cantidad_obligatorias}")
+                    logger.log(f"  - Columnas recibidas: {cantidad_encontrada}")
                     return False, "Faltan columnas obligatorias"
 
-                # Validar solo las columnas obligatorias
                 diferencias = []
-                es_desplazamiento = False
-                primera_diferencia = -1
-
                 for i in range(cantidad_obligatorias):
-                    esperada = columnas_obligatorias[i]
+                    esperada = columnas_esquema[i]
                     encontrada = headers[i] if i < cantidad_encontrada else ""
 
-                    # Comparar primeros 6 caracteres después de trim
-                    esperada_6 = esperada[:6] if len(
-                        esperada) >= 6 else esperada
-                    encontrada_6 = encontrada[:6] if len(
-                        encontrada) >= 6 else encontrada
+                    esperada_6 = esperada[:6] if len(esperada) >= 6 else esperada
+                    encontrada_6 = encontrada[:6] if len(encontrada) >= 6 else encontrada
 
                     if esperada_6 != encontrada_6:
-                        if primera_diferencia == -1:
-                            primera_diferencia = i
-                            # Verificar si es un desplazamiento
-                            if i + 1 < cantidad_encontrada:
-                                siguiente = headers[i + 1]
-                                siguiente_6 = siguiente[:6] if len(
-                                    siguiente) >= 6 else siguiente
-                                if esperada_6 == siguiente_6:
-                                    es_desplazamiento = True
-
-                        diferencias.append(
-                            f"Posición {i+1}: esperaba '{esperada}', encontró '{encontrada}'")
+                        diferencias.append(f"Posición {i+1}: esperaba '{esperada}', encontró '{encontrada}'")
 
                 if diferencias:
-                    logger.log(
-                        f"\n[ERROR] Error en columnas obligatorias (1-{cantidad_obligatorias})")
-
-                    if es_desplazamiento:
-                        columna_problema = headers[primera_diferencia] if primera_diferencia < cantidad_encontrada else ""
-                        mensaje_vacio = " (columna vacía)" if columna_problema == "" else ""
-                        logger.log(
-                            f"  - Posición {primera_diferencia + 1}: esperaba '{columnas_obligatorias[primera_diferencia]}', encontró '{columna_problema}'{mensaje_vacio}")
-                        logger.log(
-                            f"  - Desplazamiento detectado desde posición {primera_diferencia + 1}")
-                    else:
-                        # Mostrar solo primeros errores
-                        for diff in diferencias[:5]:
-                            logger.log(f"  - {diff}")
-                        if len(diferencias) > 5:
-                            logger.log(
-                                f"  ... y {len(diferencias) - 5} diferencia(s) más")
-
-                    # CAMBIO 4: Columnas adicionales son INFO, no ERROR
-                    if cantidad_encontrada > cantidad_obligatorias:
-                        logger.log(
-                            f"\n[INFO] Columnas adicionales ({cantidad_obligatorias + 1}-{cantidad_encontrada}): Permitidas por configuración")
-
+                    logger.log(f"\n[ERROR] Error en columnas obligatorias")
+                    for diff in diferencias[:5]:
+                        logger.log(f"  - {diff}")
                     return False, "Error en columnas obligatorias"
 
-                # Si llegamos aquí, las columnas obligatorias están bien
                 logger.log("[OK] Validación de columnas exitosa")
-                logger.log(
-                    f"  - Columnas obligatorias (1-{cantidad_obligatorias}): Validadas correctamente")
+                logger.log(f"  - Columnas obligatorias (1-{cantidad_obligatorias}): Validadas correctamente")
                 if cantidad_encontrada > cantidad_obligatorias:
-                    logger.log(
-                        f"  - Columnas adicionales ({cantidad_obligatorias + 1}-{cantidad_encontrada}): Permitidas por configuración")
+                    logger.log(f"  - Columnas adicionales ({cantidad_obligatorias + 1}-{cantidad_encontrada}): Permitidas")
 
                 return True, None
 
-            # Validación SIN comodín (estricta)
             else:
                 if cantidad_encontrada != cantidad_obligatorias:
                     logger.log(f"\n[ERROR] Validación de columnas fallida")
-                    logger.log(
-                        f"  - Columnas esperadas: {cantidad_obligatorias}")
-                    logger.log(
-                        f"  - Columnas encontradas: {cantidad_encontrada}")
-
-                    if cantidad_encontrada < cantidad_obligatorias:
-                        logger.log(
-                            f"  - Faltan {cantidad_obligatorias - cantidad_encontrada} columna(s)")
-                    else:
-                        # Detectar tipo de problema
-                        es_desplazamiento = False
-                        primera_diferencia = -1
-
-                        for i in range(min(cantidad_obligatorias, cantidad_encontrada)):
-                            esperada = columnas_obligatorias[i]
-                            encontrada = headers[i]
-
-                            esperada_6 = esperada[:6] if len(
-                                esperada) >= 6 else esperada
-                            encontrada_6 = encontrada[:6] if len(
-                                encontrada) >= 6 else encontrada
-
-                            if esperada_6 != encontrada_6:
-                                if primera_diferencia == -1:
-                                    primera_diferencia = i
-                                    if i + 1 < cantidad_encontrada:
-                                        siguiente = headers[i + 1]
-                                        siguiente_6 = siguiente[:6] if len(
-                                            siguiente) >= 6 else siguiente
-                                        if esperada_6 == siguiente_6:
-                                            es_desplazamiento = True
-                                break
-
-                        if es_desplazamiento:
-                            logger.log(
-                                f"\n[ERROR] Estructura incorrecta - Columna extra detectada")
-                            columna_problema = headers[primera_diferencia]
-                            mensaje_vacio = " (columna vacía)" if columna_problema == "" else ""
-                            logger.log(
-                                f"  - Posición {primera_diferencia + 1}: esperaba '{columnas_obligatorias[primera_diferencia]}', encontró '{columna_problema}'{mensaje_vacio}")
-                            logger.log(
-                                f"  - Desplazamiento detectado desde posición {primera_diferencia + 1}")
-
-                        # Columnas no permitidas (sin comodín)
-                        logger.log(f"\n[ERROR] Columnas no permitidas:")
-                        for i in range(cantidad_obligatorias, cantidad_encontrada):
-                            logger.log(
-                                f"  - Posición {i+1}: '{headers[i]}' (columna extra)")
-
+                    logger.log(f"  - Columnas esperadas: {cantidad_obligatorias}")
+                    logger.log(f"  - Columnas encontradas: {cantidad_encontrada}")
                     return False, "Cantidad de columnas incorrecta"
 
-                # Validar nombres si la cantidad es correcta
                 diferencias = []
-                for i, (esperada, encontrada) in enumerate(zip(columnas_obligatorias, headers)):
-                    esperada_6 = esperada[:6] if len(
-                        esperada) >= 6 else esperada
-                    encontrada_6 = encontrada[:6] if len(
-                        encontrada) >= 6 else encontrada
+                for i, (esperada, encontrada) in enumerate(zip(columnas_esquema, headers)):
+                    esperada_6 = esperada[:6] if len(esperada) >= 6 else esperada
+                    encontrada_6 = encontrada[:6] if len(encontrada) >= 6 else encontrada
 
                     if esperada_6 != encontrada_6:
-                        diferencias.append(
-                            f"Posición {i+1}: esperaba '{esperada}', encontró '{encontrada}'")
+                        diferencias.append(f"Posición {i+1}: esperaba '{esperada}', encontró '{encontrada}'")
 
                 if diferencias:
                     logger.log(f"\n[ERROR] Errores detectados:")
                     for diff in diferencias[:10]:
                         logger.log(f"  - {diff}")
-                    if len(diferencias) > 10:
-                        logger.log(
-                            f"  ... y {len(diferencias) - 10} diferencia(s) más")
                     return False, "Columnas no coinciden"
 
                 logger.log("[OK] Validación de columnas exitosa")
@@ -534,25 +692,20 @@ class CharacterProcessor(IProcessor):
 
     def __init__(self, reemplazos: List[Tuple[str, str]]):
         self.reemplazos = reemplazos
-        print(
-            f"[CONFIG] Cargados {len(self.reemplazos)} reemplazos de caracteres")
+        print(f"[CONFIG] Cargados {len(self.reemplazos)} reemplazos de caracteres")
 
     def procesar(self, contenido: str, separador_entrada: str, separador_salida: str) -> Tuple[str, int]:
-        """Aplica reemplazos y cambia el separador si es necesario"""
         contador_reemplazos = 0
 
-        # Elimina BOM si está presente
         if contenido.startswith('\ufeff'):
             contenido = contenido.replace('\ufeff', '')
 
-        # Aplica reemplazos de caracteres
         for original, nuevo in self.reemplazos:
             ocurrencias = contenido.count(original)
             if ocurrencias > 0:
                 contenido = contenido.replace(original, nuevo)
                 contador_reemplazos += ocurrencias
 
-        # Cambia el separador si es diferente
         if separador_entrada != separador_salida:
             contenido = contenido.replace(separador_entrada, separador_salida)
 
@@ -563,65 +716,45 @@ class SmartFileHandler(IFileHandler):
     """Manejador inteligente de archivos con detección automática de encoding"""
 
     def leer(self, ruta: str, logger: MigrationLogger) -> str:
-        """Lee un archivo detectando automáticamente su encoding"""
-        nombre_archivo = os.path.basename(ruta)
-
         with open(ruta, 'rb') as f:
             contenido_raw = f.read()
 
         if not contenido_raw:
             return ""
 
-        # Probar Windows-1252 primero (más común para CSVs de Excel)
         encodings_a_probar = [
-            'windows-1252',   # Primero Windows (más común para CSVs de Excel)
-            'cp1252',         # Alias de windows-1252
-            'iso-8859-1',     # Latin-1
-            'latin-1',        # Alias de iso-8859-1
-            'utf-8-sig',      # UTF-8 con BOM
-            'utf-8',          # UTF-8 estándar
-            'cp850',          # DOS Latin-1
-            'cp437',          # DOS US
+            'utf-8',
+            'utf-8-sig',
+            'windows-1252',
+            'cp1252',
+            'iso-8859-1',
+            'latin-1',
         ]
-
-        mejor_encoding = None
-        mejor_contenido = None
 
         for encoding in encodings_a_probar:
             try:
                 contenido = contenido_raw.decode(encoding)
 
-                # Rechazar si hay caracteres de reemplazo (indica mal encoding)
                 if '�' in contenido:
                     continue
 
-                # Buscar caracteres españoles como validación
                 caracteres_espanol = 'ÑñáéíóúÁÉÍÓÚüÜ'
 
                 if any(c in contenido for c in caracteres_espanol):
-                    logger.log(f"[ENCODING] Detectado como {encoding} ✓")
+                    logger.log(f"[ENCODING] Detectado como {encoding}")
                     return contenido
 
-                # Guardar el primer encoding que funcione sin errores
-                if mejor_encoding is None and ('\n' in contenido or '\r' in contenido):
-                    mejor_encoding = encoding
-                    mejor_contenido = contenido
+                if '\n' in contenido or '\r' in contenido:
+                    logger.log(f"[ENCODING] Usando {encoding}")
+                    return contenido
 
             except (UnicodeDecodeError, AttributeError):
                 continue
 
-        # Si encontramos un encoding que funcionó, usarlo
-        if mejor_contenido:
-            logger.log(f"[ENCODING] Usando {mejor_encoding}")
-            return mejor_contenido
-
-        # Fallback: forzar Windows-1252 (más común para archivos de Excel en español)
-        logger.log(
-            f"[WARN] No se pudo detectar encoding, forzando windows-1252")
-        return contenido_raw.decode('windows-1252', errors='replace')
+        logger.log(f"[WARN] No se pudo detectar encoding, forzando utf-8")
+        return contenido_raw.decode('utf-8', errors='replace')
 
     def escribir(self, ruta: str, contenido: str) -> None:
-        """Escribe siempre en UTF-8"""
         with open(ruta, 'w', encoding='utf-8') as f:
             f.write(contenido)
 
@@ -633,7 +766,6 @@ class FTPUploader(IUploader):
         self.config = config
 
     def _limpiar_remoto(self, ftp: FTP, logger: MigrationLogger) -> None:
-        """Limpia la carpeta remota"""
         logger.log("\n[FTP] Limpiando carpeta remota...")
         try:
             archivos_remotos = ftp.nlst()
@@ -648,7 +780,6 @@ class FTPUploader(IUploader):
             logger.log(f"[FTP WARN] No se pudo limpiar carpeta remota: {exc}")
 
     def subir(self, carpeta_local: str, logger: MigrationLogger) -> bool:
-        """Sube archivos al servidor FTP"""
         logger.inicio_ftp(self.config)
 
         try:
@@ -672,18 +803,16 @@ class FTPUploader(IUploader):
 
                 try:
                     size = os.path.getsize(ruta_archivo)
-                    size_mb = size / (1024 * 1024)
+                    size_kb = size / 1024
 
                     with open(ruta_archivo, 'rb') as f:
                         ftp.storlines(f"STOR {archivo}", f)
 
-                    if size_mb > 1:
-                        logger.log(
-                            f"  ✓ {archivo} - Subido exitosamente ({size_mb:.1f} MB)")
+                    if size_kb > 1024:
+                        size_mb = size_kb / 1024
+                        logger.log(f"  ✓ {archivo} ({size_mb:.1f} MB)")
                     else:
-                        size_kb = size / 1024
-                        logger.log(
-                            f"  ✓ {archivo} - Subido exitosamente ({size_kb:.0f} KB)")
+                        logger.log(f"  ✓ {archivo} ({size_kb:.0f} KB)")
 
                     logger.archivos_ftp_ok.append(archivo)
 
@@ -706,7 +835,6 @@ class DummyUploader(IUploader):
     """Uploader de prueba que no sube nada"""
 
     def subir(self, carpeta_local: str, logger: MigrationLogger) -> bool:
-        """Simula subir archivos sin conexión real"""
         logger.log("\n" + "=" * 80)
         logger.log("MODO DUMMY FTP - SIMULACIÓN")
         logger.log("=" * 80)
@@ -732,64 +860,85 @@ class MigrationOrchestrator:
 
     def __init__(self,
                  process_config: ProcessConfig,
+                 excel_converter: ExcelConverter,
                  validator: IValidator,
                  processor: IProcessor,
                  file_handler: IFileHandler,
                  uploader: IUploader,
                  logger: MigrationLogger):
         self.process_config = process_config
+        self.excel_converter = excel_converter
         self.validator = validator
         self.processor = processor
         self.file_handler = file_handler
         self.uploader = uploader
         self.logger = logger
-        self.separador_entrada = '|'  # Se actualizará con input del usuario
+        self.carpeta_temporal = '.temp_csv'
+        self.separador_csv = ';'
+        self.tipo_entrada = 'xlsx'
 
-    def solicitar_separador(self) -> str:
-        """Solicita al usuario el separador de los archivos de entrada"""
+    def solicitar_tipo_entrada(self) -> str:
+        """Solicita al usuario el tipo de archivos a procesar"""
         print("\n" + "=" * 60)
-        print("CONFIGURACIÓN DE SEPARADOR")
+        print("TIPO DE ARCHIVOS A PROCESAR")
         print("=" * 60)
 
-        separadores_comunes = {
-            '1': '|',
-            '2': ';',
-            '3': ',',
-            '4': '\t',
-            '5': 'otro'
-        }
+        print("¿Qué tipo de archivos desea procesar?")
+        print("  1) Excel (.xlsx) desde entrada_xlsx/")
+        print("  2) CSV (.csv) desde entrada_csv/")
 
-        print("¿Cuál es el separador de los archivos de entrada?")
-        print("  1) Pipe (|)")
-        print("  2) Punto y coma (;)")
+        while True:
+            opcion = input("\nSeleccione una opción (1-2): ").strip()
+
+            if opcion == '1':
+                print("Seleccionado: Excel (.xlsx)")
+                return 'xlsx'
+            elif opcion == '2':
+                print("Seleccionado: CSV (.csv)")
+                return 'csv'
+            else:
+                print("Opción inválida. Por favor seleccione 1 o 2.")
+
+    def solicitar_separador(self) -> str:
+        """Solicita al usuario el separador para el CSV"""
+        print("\n" + "=" * 60)
+        print("CONFIGURACIÓN DE SEPARADOR CSV")
+        print("=" * 60)
+
+        if self.tipo_entrada == 'xlsx':
+            print("¿Con qué separador desea generar los archivos CSV?")
+        else:
+            print("¿Qué separador tienen los archivos CSV de entrada?")
+
+        print("  1) Punto y coma (;)  ← Recomendado")
+        print("  2) Pipe (|)")
         print("  3) Coma (,)")
         print("  4) Tabulador (\\t)")
         print("  5) Otro")
 
         while True:
-            opcion = input("\nSeleccione una opción (1-5): ").strip()
+            opcion = input("\nSeleccione una opción (1-5) [1]: ").strip()
 
-            if opcion in separadores_comunes:
-                if opcion == '5':
-                    separador = input("Ingrese el separador personalizado: ")
-                    if separador:
-                        print(f"Separador seleccionado: '{separador}'")
-                        return separador
-                else:
-                    separador = separadores_comunes[opcion]
-                    nombre = {
-                        '|': 'Pipe (|)',
-                        ';': 'Punto y coma (;)',
-                        ',': 'Coma (,)',
-                        '\t': 'Tabulador'
-                    }.get(separador, separador)
-                    print(f"Separador seleccionado: {nombre}")
+            if opcion == '':
+                opcion = '1'
+
+            separadores = {'1': ';', '2': '|', '3': ',', '4': '\t'}
+
+            if opcion in separadores:
+                separador = separadores[opcion]
+                nombre = {';': 'Punto y coma (;)', '|': 'Pipe (|)',
+                          ',': 'Coma (,)', '\t': 'Tabulador'}.get(separador)
+                print(f"Separador seleccionado: {nombre}")
+                return separador
+            elif opcion == '5':
+                separador = input("Ingrese el separador personalizado: ")
+                if separador:
+                    print(f"Separador seleccionado: '{separador}'")
                     return separador
             else:
                 print("Opción inválida. Por favor seleccione 1-5.")
 
     def limpiar_directorio(self, directorio: str) -> None:
-        """Limpia o crea un directorio"""
         if os.path.exists(directorio):
             for archivo in os.listdir(directorio):
                 ruta = os.path.join(directorio, archivo)
@@ -800,30 +949,43 @@ class MigrationOrchestrator:
             os.makedirs(directorio)
             self.logger.log(f"[CLEAN] Directorio creado: {directorio}")
 
-    def procesar_archivos(self) -> None:
-        """Procesa todos los archivos del directorio origen"""
-        origen = self.process_config.carpeta_origen
-        destino = self.process_config.carpeta_destino
+    def crear_carpetas_si_no_existen(self):
+        """Crea las carpetas de entrada si no existen"""
+        for carpeta in [self.process_config.carpeta_entrada_xlsx,
+                        self.process_config.carpeta_entrada_csv,
+                        self.process_config.carpeta_salida]:
+            if not os.path.exists(carpeta):
+                os.makedirs(carpeta)
+                print(f"[INFO] Creada carpeta: {carpeta}/")
 
-        if not os.path.exists(origen):
-            self.logger.log(f"[ERROR] La carpeta origen '{origen}' no existe")
-            return
+    def procesar_archivos_csv(self, carpeta_csv: str, archivos_origen: Dict[str, str]) -> List[str]:
+        """
+        Procesa todos los archivos CSV.
+        
+        Args:
+            carpeta_csv: Carpeta con los CSV a procesar
+            archivos_origen: Diccionario {nombre_csv: ruta_archivo_origen}
+        
+        Returns:
+            Lista de archivos origen procesados exitosamente
+        """
+        self.logger.inicio_procesamiento()
 
+        destino = self.process_config.carpeta_salida
         os.makedirs(destino, exist_ok=True)
-        archivos = os.listdir(origen)
+
+        archivos = [f for f in os.listdir(carpeta_csv) if f.lower().endswith('.csv')]
 
         if not archivos:
-            self.logger.log(f"[WARN] No hay archivos en '{origen}'")
-            return
+            self.logger.log(f"[WARN] No hay archivos CSV para procesar")
+            return []
 
-        self.logger.log(
-            f"\n[PROCESO] Encontrados {len(archivos)} archivos para procesar")
+        self.logger.log(f"[PROCESO] {len(archivos)} archivos CSV para procesar")
 
-        # Actualizar el validador con el separador correcto
-        self.validator.separador = self.separador_entrada
+        archivos_exitosos = []
 
         for archivo in archivos:
-            ruta_origen = os.path.join(origen, archivo)
+            ruta_origen = os.path.join(carpeta_csv, archivo)
             ruta_destino = os.path.join(destino, archivo)
 
             if os.path.isfile(ruta_origen):
@@ -831,81 +993,160 @@ class MigrationOrchestrator:
                 exitoso = False
 
                 try:
-                    # Lee el archivo
-                    contenido = self.file_handler.leer(
-                        ruta_origen, self.logger)
+                    contenido = self.file_handler.leer(ruta_origen, self.logger)
 
                     if not contenido.strip():
                         self.logger.log("[WARN] Archivo vacío o ilegible")
                         self.logger.fin_archivo(archivo, False)
                         continue
 
-                    # Valida estructura de columnas
                     es_valido, mensaje_error = self.validator.validar(
                         archivo, contenido, self.logger)
                     if not es_valido:
                         self.logger.fin_archivo(archivo, False)
                         continue
 
-                    # Procesa el contenido
                     contenido_modificado, num_reemplazos = self.processor.procesar(
                         contenido,
-                        self.separador_entrada,
+                        self.separador_csv,
                         self.process_config.separador_salida
                     )
 
                     self.logger.log("[OK] Reemplazo de caracteres completado")
                     if num_reemplazos > 0:
-                        self.logger.log(
-                            f"  - Caracteres especiales procesados: {num_reemplazos} reemplazos")
+                        self.logger.log(f"  - Caracteres especiales procesados: {num_reemplazos}")
 
-                    # Escribe el resultado
-                    self.file_handler.escribir(
-                        ruta_destino, contenido_modificado)
-                    self.logger.log(
-                        f"[OK] Archivo guardado en {destino}/{archivo}")
+                    self.file_handler.escribir(ruta_destino, contenido_modificado)
+                    self.logger.log(f"[OK] Archivo guardado en {destino}/{archivo}")
 
                     exitoso = True
+
+                    # Guardar el archivo origen para eliminar después
+                    if archivo in archivos_origen:
+                        archivos_exitosos.append(archivos_origen[archivo])
 
                 except Exception as exc:
                     self.logger.log(f"[ERROR] Error procesando archivo: {exc}")
 
                 self.logger.fin_archivo(archivo, exitoso)
 
+        return archivos_exitosos
+
+    def limpiar_temporal(self):
+        """Elimina la carpeta temporal"""
+        if os.path.exists(self.carpeta_temporal):
+            shutil.rmtree(self.carpeta_temporal)
+
     def ejecutar(self, skip_ftp: bool = False) -> None:
         """Ejecuta el proceso completo de migración"""
         self.logger.inicio_proceso()
 
-        # Solicitar separador al usuario
-        self.separador_entrada = self.solicitar_separador()
+        # Crear carpetas si no existen
+        self.crear_carpetas_si_no_existen()
+
+        # Solicitar tipo de entrada
+        self.tipo_entrada = self.solicitar_tipo_entrada()
+
+        # Solicitar separador
+        self.separador_csv = self.solicitar_separador()
+
+        # Actualizar separador en componentes
+        self.excel_converter.separador = self.separador_csv
+        self.validator.separador = self.separador_csv
+
+        # Determinar carpeta de entrada según selección
+        if self.tipo_entrada == 'xlsx':
+            carpeta_entrada = self.process_config.carpeta_entrada_xlsx
+        else:
+            carpeta_entrada = self.process_config.carpeta_entrada_csv
 
         print("\n[CONFIG] Configuración del proceso:")
-        print(f"  - Carpeta origen: {self.process_config.carpeta_origen}")
-        print(f"  - Carpeta destino: {self.process_config.carpeta_destino}")
-        print(f"  - Separador entrada: {repr(self.separador_entrada)}")
-        print(
-            f"  - Separador salida: {repr(self.process_config.separador_salida)}")
+        print(f"  - Tipo de entrada: {self.tipo_entrada.upper()}")
+        print(f"  - Carpeta entrada: {carpeta_entrada}/")
+        print(f"  - Carpeta salida: {self.process_config.carpeta_salida}/")
+        print(f"  - Separador CSV: {repr(self.separador_csv)}")
+        print(f"  - Separador salida: {repr(self.process_config.separador_salida)}")
+        print(f"  - Conservar entrada: {'Sí' if self.process_config.conservar_entrada else 'No'}")
         print()
 
-        # 1. Limpia directorio destino
-        self.limpiar_directorio(self.process_config.carpeta_destino)
+        # 1. Limpiar directorio salida
+        self.limpiar_directorio(self.process_config.carpeta_salida)
 
-        # 2. Procesa archivos
-        self.logger.log("\n[PROCESO] Validando y procesando archivos...")
-        self.procesar_archivos()
+        archivos_a_eliminar = []
 
-        # 3. Sube por FTP (opcional)
+        if self.tipo_entrada == 'xlsx':
+            # 2a. Convertir XLSX → CSV
+            archivos_csv, archivos_xlsx_exitosos = self.excel_converter.convertir_carpeta(
+                carpeta_entrada, self.carpeta_temporal, self.logger
+            )
+
+            # Mapear CSV a XLSX origen
+            archivos_origen = {}
+            for xlsx in archivos_xlsx_exitosos:
+                csv_name = xlsx.rsplit('.', 1)[0] + '.csv'
+                archivos_origen[csv_name] = os.path.join(carpeta_entrada, xlsx)
+
+            # 3. Procesar archivos CSV
+            if archivos_csv:
+                archivos_a_eliminar = self.procesar_archivos_csv(
+                    self.carpeta_temporal, archivos_origen
+                )
+
+        else:
+            # 2b. Copiar CSV a carpeta temporal para procesar
+            archivos_csv = [f for f in os.listdir(carpeta_entrada)
+                            if f.lower().endswith('.csv')]
+
+            if archivos_csv:
+                os.makedirs(self.carpeta_temporal, exist_ok=True)
+
+                archivos_origen = {}
+                for csv_file in archivos_csv:
+                    src = os.path.join(carpeta_entrada, csv_file)
+                    dst = os.path.join(self.carpeta_temporal, csv_file)
+                    shutil.copy2(src, dst)
+                    archivos_origen[csv_file] = src
+
+                # 3. Procesar archivos CSV
+                archivos_a_eliminar = self.procesar_archivos_csv(
+                    self.carpeta_temporal, archivos_origen
+                )
+            else:
+                self.logger.log(f"[INFO] No hay archivos .csv en {carpeta_entrada}/")
+
+        # 4. Limpiar carpeta temporal
+        self.limpiar_temporal()
+
+        # 5. Subir por FTP (opcional)
+        ftp_exitoso = False
         if not skip_ftp and self.logger.archivos_procesados:
-            self.uploader.subir(
-                self.process_config.carpeta_destino, self.logger)
+            ftp_exitoso = self.uploader.subir(self.process_config.carpeta_salida, self.logger)
         elif skip_ftp:
             self.logger.log("\n[INFO] Subida FTP omitida (modo prueba)")
+            ftp_exitoso = True  # En modo prueba, consideramos exitoso
         elif not self.logger.archivos_procesados:
             self.logger.log("\n[INFO] No hay archivos para subir por FTP")
 
-        # 4. Resumen final
+        # 6. Eliminar archivos origen SOLO si FTP fue exitoso y no está configurado CONSERVAR_ENTRADA
+        if self.process_config.conservar_entrada:
+            self.logger.log("\n[INFO] CONSERVAR_ENTRADA=true - Archivos de entrada no eliminados")
+        elif ftp_exitoso and archivos_a_eliminar:
+            self.logger.log("\n[CLEAN] Limpiando archivos de entrada procesados...")
+            for archivo_origen in archivos_a_eliminar:
+                if os.path.exists(archivo_origen):
+                    os.remove(archivo_origen)
+                    self.logger.log(f"  - Eliminado: {os.path.basename(archivo_origen)}")
+        elif not ftp_exitoso and archivos_a_eliminar:
+            self.logger.log("\n[WARN] Archivos NO eliminados de entrada (FTP falló)")
+            self.logger.log("       Los archivos permanecen para reintentar")
+
+        # 7. Resumen final
         self.logger.resumen_final(
-            self.separador_entrada, self.process_config.separador_salida)
+            self.tipo_entrada,
+            self.separador_csv,
+            self.process_config.separador_salida,
+            self.process_config.conservar_entrada
+        )
 
 
 # =============================================================================
@@ -913,14 +1154,9 @@ class MigrationOrchestrator:
 # =============================================================================
 
 def main():
-    """Función principal - configura e inicia el proceso"""
+    """Función principal"""
 
-    # Verificar si estamos en modo desarrollo
-    modo_desarrollo = os.getenv('MODO_DESARROLLO', 'false').lower() == 'true'
     skip_ftp = os.getenv('SKIP_FTP', 'false').lower() == 'true'
-
-    if modo_desarrollo:
-        print("[MODO] Ejecutando en modo desarrollo")
 
     # Configuraciones
     process_config = ProcessConfig()
@@ -929,19 +1165,23 @@ def main():
     # Crear logger
     logger = MigrationLogger(process_config.carpeta_logs)
 
-    # Cargar reemplazos desde archivo o usar por defecto
+    # Cargar reemplazos
     reemplazos = process_config.cargar_reemplazos()
 
-    # Crear implementaciones (Dependency Injection)
+    # Crear cargador de esquemas
+    schema_loader = SchemaLoader(process_config.archivo_esquemas)
+
+    # Crear implementaciones
+    excel_converter = ExcelConverter(schema_loader=schema_loader, separador=';')
+
     validator = ColumnValidator(
-        archivo_esquemas=process_config.archivo_esquemas,
-        separador='|'  # Se actualizará con input del usuario
+        schema_loader=schema_loader,
+        separador=';'
     )
     processor = CharacterProcessor(reemplazos)
     file_handler = SmartFileHandler()
 
-    # Seleccionar uploader según modo
-    if modo_desarrollo or skip_ftp:
+    if skip_ftp:
         uploader = DummyUploader()
     else:
         uploader = FTPUploader(ftp_config)
@@ -949,6 +1189,7 @@ def main():
     # Crear y ejecutar orquestador
     orchestrator = MigrationOrchestrator(
         process_config=process_config,
+        excel_converter=excel_converter,
         validator=validator,
         processor=processor,
         file_handler=file_handler,

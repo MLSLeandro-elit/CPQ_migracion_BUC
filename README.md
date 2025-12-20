@@ -1,83 +1,111 @@
-# Sistema de Migración AS400
+# CPQ Migration Tool
 
-Script Python para procesar archivos CSV, validar estructura de columnas, aplicar transformaciones de caracteres y subirlos por FTP a servidor AS400.
+Herramienta de migración para procesar archivos Excel/CSV, aplicar transformaciones y subirlos al servidor AS400 vía FTP.
 
-## 📋 Características
+## Tabla de Contenidos
 
-- **Validación de columnas** según esquemas configurables
-- **Detección automática de encoding** (UTF-8, Windows-1252, ISO-8859-1)
-- **Reemplazo de caracteres especiales** parametrizable
-- **Soporte para columnas opcionales** mediante comodín (`*`)
-- **Logging detallado** de todo el proceso
-- **Subida FTP** con limpieza automática del directorio remoto
-- **Modo desarrollo** para pruebas sin conexión FTP
+- [Descripción](#descripción)
+- [Requisitos](#requisitos)
+- [Instalación](#instalación)
+- [Configuración](#configuración)
+- [Uso](#uso)
+- [Estructura del Proyecto](#estructura-del-proyecto)
+- [Esquemas de Archivos](#esquemas-de-archivos)
+- [Variables de Entorno](#variables-de-entorno)
+- [Logs](#logs)
+- [Solución de Problemas](#solución-de-problemas)
 
-## 🚀 Instalación
+## Descripción
 
-### 1. Clonar el repositorio
+Este script automatiza el proceso de migración de datos desde archivos Excel (.xlsx) o CSV hacia el servidor AS400. El proceso incluye:
+
+- Conversión de archivos Excel a CSV
+- Validación de estructura según esquemas configurados
+- Transformación de caracteres especiales
+- Cambio de separadores
+- Subida automática por FTP
+
+## Requisitos
+
+- Python 3.8 o superior
+- Acceso al servidor FTP AS400
+- Archivos de configuración (esquemas, reemplazos)
+
+## Instalación
+
+1. Clonar el repositorio:
 
 ```bash
-git clone [url-del-repositorio]
-cd migracion-as400
+git clone <repository-url>
+cd cpq-migration
 ```
 
-### 2. Instalar dependencias
+2. Crear y activar entorno virtual:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate  # Linux/macOS
+```
+
+3. Instalar dependencias:
 
 ```bash
 pip install -r requirements.txt
 ```
 
-### 3. Configurar variables de entorno
+4. Configurar variables de entorno:
 
 ```bash
 cp .env.example .env
+# Editar .env con los valores correspondientes
 ```
 
-Editar `.env` con las credenciales reales:
+## Configuración
 
-```bash
-FTP_USER=tu_usuario
-FTP_PASSWORD=tu_password
-```
+### Archivos de Configuración
 
-## 📁 Estructura del Proyecto
+| Archivo | Descripción |
+|---------|-------------|
+| `.env` | Variables de entorno (FTP, rutas, opciones) |
+| `config/esquemas.json` | Definición de estructura por tipo de archivo |
+| `config/reemplazos.json` | Mapeo de caracteres especiales |
 
-```
-migracion-as400/
-├── config/
-│   ├── esquemas.json       # Definición de columnas por tipo de archivo
-│   └── reemplazos.json     # Mapeo de caracteres especiales
-├── raw/                     # Carpeta de archivos de entrada
-├── processed/               # Carpeta de archivos procesados
-├── logs/                    # Logs de cada ejecución
-├── .env                     # Variables de entorno (no se sube a Git)
-├── .env.example            # Plantilla de configuración
-├── migration.py            # Script principal
-├── requirements.txt        # Dependencias Python
-└── README.md              # Este archivo
-```
+### Configuración de Esquemas
 
-## ⚙️ Configuración
-
-### Esquemas de columnas (`config/esquemas.json`)
-
-Define las columnas esperadas para cada tipo de archivo:
+Cada tipo de archivo se configura en `config/esquemas.json`:
 
 ```json
 {
-  "CPQMIGPN": [
-    "FECING",
-    "AGCVIN",
-    "...",
-    "ESTADOT",
-    "*"
-  ]
+  "NOMBRE_ARCHIVO": {
+    "filas_omitir": [1, 3],
+    "columnas": ["COL1", "COL2", "COL3"],
+    "fechas_numericas": ["FECHA1", "FECHA2"]
+  }
 }
 ```
 
-El `*` al final indica que se permiten columnas adicionales.
+| Campo | Tipo | Descripción |
+|-------|------|-------------|
+| `filas_omitir` | array | Filas a eliminar antes de procesar (numeración desde 1) |
+| `columnas` | array | Lista ordenada de nombres de columnas |
+| `fechas_numericas` | array | Columnas que contienen fechas en formato numérico |
 
-### Reemplazos de caracteres (`config/reemplazos.json`)
+#### Comodín para columnas adicionales
+
+Usar `*` al final del array de columnas para permitir columnas adicionales:
+
+```json
+{
+  "ARCHIVO_FLEXIBLE": {
+    "columnas": ["COL1", "COL2", "COL3", "*"],
+    "fechas_numericas": []
+  }
+}
+```
+
+### Configuración de Reemplazos
+
+Definir caracteres a reemplazar en `config/reemplazos.json`:
 
 ```json
 {
@@ -88,83 +116,190 @@ El `*` al final indica que se permiten columnas adicionales.
 }
 ```
 
-## 🎮 Uso
+## Uso
 
-### Ejecución normal
+### Ejecución
 
 ```bash
 python migration.py
 ```
 
-El script:
+### Flujo Interactivo
 
-1. Solicita el separador de los archivos de entrada
-2. Valida la estructura de columnas según esquemas
-3. Rechaza archivos no parametrizados o con caracteres corruptos
-4. Procesa y transforma los archivos válidos
-5. Sube los archivos al servidor FTP
-6. Genera log detallado en `logs/`
+1. **Selección de tipo de archivo:**
 
-### Modo desarrollo (sin FTP)
+```
+¿Qué tipo de archivos desea procesar?
+  1) Excel (.xlsx) desde entrada_xlsx/
+  2) CSV (.csv) desde entrada_csv/
+```
+
+2. **Selección de separador:**
+
+```
+¿Qué separador tienen los archivos CSV?
+  1) Punto y coma (;)
+  2) Pipe (|)
+  3) Coma (,)
+  4) Tabulador (\t)
+  5) Otro
+```
+
+3. **Procesamiento automático:**
+   - Validación de estructura
+   - Transformación de datos
+   - Subida FTP
+
+### Modo de Prueba
+
+Para ejecutar sin subir al servidor FTP:
 
 ```bash
 SKIP_FTP=true python migration.py
 ```
 
-### Modo prueba completo
+## Estructura del Proyecto
 
-```bash
-MODO_DESARROLLO=true python migration.py
+```
+cpq-migration/
+├── migration.py            # Script principal
+├── requirements.txt        # Dependencias Python
+├── .env                    # Variables de entorno (no versionado)
+├── .env.example            # Plantilla de variables
+├── config/
+│   ├── esquemas.json       # Definición de estructuras
+│   └── reemplazos.json     # Mapeo de caracteres
+├── entrada_xlsx/           # Archivos Excel de entrada
+├── entrada_csv/            # Archivos CSV de entrada
+├── salida/                 # Archivos procesados
+└── logs/                   # Registros de ejecución
 ```
 
-## 📝 Validaciones
+### Carpetas de Entrada
 
-### Archivos aceptados
+| Carpeta | Descripción |
+|---------|-------------|
+| `entrada_xlsx/` | Colocar archivos Excel (.xlsx) a procesar |
+| `entrada_csv/` | Colocar archivos CSV (.csv) a procesar |
 
-- ✅ Archivos parametrizados en `esquemas.json`
-- ✅ Encodings válidos (UTF-8, Windows-1252, ISO-8859-1)
-- ✅ Estructura de columnas correcta
+### Carpetas de Salida
 
-### Archivos rechazados
+| Carpeta | Descripción |
+|---------|-------------|
+| `salida/` | Archivos procesados listos para FTP |
+| `logs/` | Registros detallados de cada ejecución |
 
-- ❌ No configurados en esquemas
-- ❌ Con caracteres corruptos (`�`, `ï¿½`)
-- ❌ Estructura de columnas incorrecta
-- ❌ Faltan columnas obligatorias
+## Esquemas de Archivos
 
-## 📊 Logs
+### Tipos de Archivo Soportados
 
-Los logs se generan en `logs/migracion_YYYYMMDD_HHMMSS.log` con:
+| Archivo | Descripción |
+|---------|-------------|
+| CPQMIGPN | Personas naturales |
+| CPQMIGPJ | Personas jurídicas |
+| HOMOBENEF | Beneficiarios |
+| HOMOROLESF | Roles y relaciones |
 
-- Estado de cada archivo procesado
-- Errores de validación detallados
-- Proceso FTP completo
-- Resumen final de la ejecución
+### Validaciones Aplicadas
 
-## 🔧 Solución de Problemas
+- Cantidad de columnas según esquema
+- Orden de columnas
+- Formato de fechas numéricas
 
-### Error: "Archivo contiene caracteres corruptos"
+## Variables de Entorno
 
-El archivo tiene caracteres mal codificados. Solución:
+### Conexión FTP
 
-1. Abrir el archivo en Excel
-2. Guardar como → CSV UTF-8 (delimitado por comas)
+| Variable | Descripción | Ejemplo |
+|----------|-------------|---------|
+| `FTP_HOST` | Servidor FTP | `10.238.60.3` |
+| `FTP_USER` | Usuario FTP | `USUARIO` |
+| `FTP_PASSWORD` | Contraseña FTP | `********` |
+| `FTP_CARPETA_REMOTA` | Carpeta destino | `/MIGCPQBUC` |
 
-### Error: "Archivo no parametrizado en esquemas"
+### Rutas y Archivos
 
-Agregar la configuración del archivo en `config/esquemas.json`
+| Variable | Descripción | Default |
+|----------|-------------|---------|
+| `CARPETA_ENTRADA_XLSX` | Carpeta de Excel | `entrada_xlsx` |
+| `CARPETA_ENTRADA_CSV` | Carpeta de CSV | `entrada_csv` |
+| `CARPETA_SALIDA` | Carpeta de salida | `salida` |
+| `CARPETA_LOGS` | Carpeta de logs | `logs` |
+| `ARCHIVO_ESQUEMAS` | Ruta esquemas | `config/esquemas.json` |
+| `ARCHIVO_REEMPLAZOS` | Ruta reemplazos | `config/reemplazos.json` |
 
-### Error: "Columnas no coinciden"
+### Opciones de Procesamiento
 
-Verificar que:
+| Variable | Descripción | Default |
+|----------|-------------|---------|
+| `SEPARADOR_SALIDA` | Separador del archivo final | `\|` |
+| `CONSERVAR_ENTRADA` | No eliminar archivos de entrada | `false` |
+| `SKIP_FTP` | Omitir subida FTP | `false` |
 
-- No haya columnas vacías extras (doble coma `,,`)
-- Los nombres coincidan en los primeros 6 caracteres
-- La cantidad de columnas sea correcta
+## Logs
 
-## 🤝 Contribuir
+Los registros se guardan en `logs/` con formato:
 
-1. Crear rama para cambios: `git checkout -b feature/nueva-funcionalidad`
-2. Hacer commit: `git commit -m "Descripción del cambio"`
-3. Push: `git push origin feature/nueva-funcionalidad`
-4. Crear Pull Request
+```
+migracion_YYYYMMDD_HHMMSS.log
+```
+
+### Contenido del Log
+
+- Inicio y fin de proceso
+- Archivos procesados
+- Validaciones realizadas
+- Errores encontrados
+- Resultado de subida FTP
+
+### Ejemplo de Log
+
+```
+================================================================================
+2025-01-15 10:30:00 - INICIO PROCESO DE MIGRACIÓN
+================================================================================
+
+FASE 1: CONVERSIÓN XLSX → CSV
+--------------------------------------------------------------------------------
+  [OK] CPQMIGPN.xlsx → CPQMIGPN.csv (150 filas, 96 columnas)
+
+FASE 2: VALIDACIÓN Y PROCESAMIENTO CSV
+--------------------------------------------------------------------------------
+ARCHIVO: CPQMIGPN.csv
+[OK] Validación de columnas exitosa
+[OK] Reemplazo de caracteres completado
+[OK] Archivo guardado en salida/CPQMIGPN.csv
+
+FASE 3: SUBIDA FTP AL SERVIDOR AS400
+================================================================================
+  ✓ CPQMIGPN.csv (45 KB)
+
+RESUMEN FINAL
+================================================================================
+Archivos procesados: 1
+Archivos subidos: 1
+```
+
+## Solución de Problemas
+
+### Error: Columnas insuficientes
+
+**Causa:** El archivo no tiene la cantidad de columnas esperada.
+
+**Solución:** Verificar que el archivo corresponda al tipo correcto y que el esquema esté actualizado.
+
+### Error: Archivo no parametrizado
+
+**Causa:** El nombre del archivo no coincide con ningún tipo en `esquemas.json`.
+
+**Solución:** Agregar la configuración del archivo en `esquemas.json` o renombrar el archivo.
+
+### Error: Conexión FTP fallida
+
+**Causa:** Credenciales incorrectas o servidor inaccesible.
+
+**Solución:** Verificar variables de entorno FTP y conectividad de red.
+
+## Licencia
+
+Uso interno - Taylor & Johnson

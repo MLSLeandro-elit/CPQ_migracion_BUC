@@ -6,10 +6,16 @@
 raw/
 processed/
 logs/
+entrada_csv/
+entrada_xlsx/
+salida/
 
 
-# Versiones antiguas
+# Versiones antiguas y temporales
+.old/
+.tmp/
 old/
+tmp/
 
 # Python
 __pycache__/
@@ -20,6 +26,7 @@ __pycache__/
 venv/
 env/
 ENV/
+.venv/
 
 # IDE
 .vscode/
@@ -42,3 +49,7 @@ desktop.ini
 # Archivos de Excel temporales
 ~$*.xlsx
 ~$*.xls
+
+# Configuración de Google API
+config/credentials.json
+config/token.json
