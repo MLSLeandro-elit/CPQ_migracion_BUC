@@ -205,10 +205,10 @@
       "NITCLI",
       "TIPDOC",
       "NITCLIR",
-      "PRIAPER",
-      "SEGAPER",
-      "PRINOMR",
-      "SEGNOMR",
+      "PRIAPE",
+      "SEGAPE",
+      "PRINOM",
+      "SEGNOM",
       "ROL"
     ],
     "fechas_numericas": []
