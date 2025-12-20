@@ -19,15 +19,21 @@ Herramienta de migración para procesar archivos Excel/CSV, aplicar transformaci
 
 Este script automatiza el proceso de migración de datos desde archivos Excel (.xlsx) o CSV hacia el servidor AS400. El proceso incluye:
 
-- Conversión de archivos Excel a CSV
 - Validación de estructura según esquemas configurados
+- Eliminación de filas configurables (encabezados extra, categorías)
+- Renombrado de columnas según esquema
+- Conversión de fechas numéricas a formato YYYYMMDD
+- Limpieza de valores numéricos (elimina `.0` de enteros)
 - Transformación de caracteres especiales
 - Cambio de separadores
 - Subida automática por FTP
 
+**Nota:** Tanto archivos Excel como CSV reciben las mismas transformaciones.
+
 ## Requisitos
 
 - Python 3.8 o superior
+- Dependencias: pandas, openpyxl, python-dotenv
 - Acceso al servidor FTP AS400
 - Archivos de configuración (esquemas, reemplazos)
 
@@ -134,10 +140,10 @@ python migration.py
   2) CSV (.csv) desde entrada_csv/
 ```
 
-2. **Selección de separador:**
+2. **Selección de separador (solo para CSV):**
 
 ```
-¿Qué separador tienen los archivos CSV?
+¿Qué separador tienen los archivos CSV de entrada?
   1) Punto y coma (;)
   2) Pipe (|)
   3) Coma (,)
@@ -146,8 +152,11 @@ python migration.py
 ```
 
 3. **Procesamiento automático:**
-   - Validación de estructura
-   - Transformación de datos
+   - Eliminación de filas según `filas_omitir`
+   - Renombrado de columnas según esquema
+   - Conversión de fechas numéricas
+   - Limpieza de valores numéricos
+   - Transformación de caracteres
    - Subida FTP
 
 ### Modo de Prueba
@@ -193,6 +202,10 @@ cpq-migration/
 
 ### Tipos de Archivo Soportados
 
+Los tipos de archivo se definen en `config/esquemas.json`. Se pueden agregar tantos como se necesiten.
+
+**Ejemplos configurados:**
+
 | Archivo | Descripción |
 |---------|-------------|
 | CPQMIGPN | Personas naturales |
@@ -200,11 +213,21 @@ cpq-migration/
 | HOMOBENEF | Beneficiarios |
 | HOMOROLESF | Roles y relaciones |
 
-### Validaciones Aplicadas
+Para agregar un nuevo tipo, crear una entrada en `esquemas.json` con el nombre del archivo (sin extensión).
 
-- Cantidad de columnas según esquema
-- Orden de columnas
-- Formato de fechas numéricas
+### Transformaciones Aplicadas
+
+Las siguientes transformaciones se aplican tanto a archivos XLSX como CSV:
+
+| Transformación | Descripción |
+|----------------|-------------|
+| Eliminar filas | Según `filas_omitir` en esquema |
+| Renombrar columnas | Por posición según `columnas` en esquema |
+| Fechas numéricas | Convierte a YYYYMMDD según `fechas_numericas` |
+| Limpiar enteros | `2500000.0` → `2500000` |
+| Separador decimal | Configurable via `SEPARADOR_DECIMAL` |
+| Caracteres especiales | Según `reemplazos.json` |
+| Separador salida | Configurable via `SEPARADOR_SALIDA` |
 
 ## Variables de Entorno
 
@@ -233,8 +256,14 @@ cpq-migration/
 | Variable | Descripción | Default |
 |----------|-------------|---------|
 | `SEPARADOR_SALIDA` | Separador del archivo final | `\|` |
+| `SEPARADOR_DECIMAL` | Separador decimal para números | `.` |
 | `CONSERVAR_ENTRADA` | No eliminar archivos de entrada | `false` |
 | `SKIP_FTP` | Omitir subida FTP | `false` |
+
+**Nota sobre SEPARADOR_DECIMAL:**
+- `.` (punto): `3500000.5` → `3500000.5`
+- `,` (coma): `3500000.5` → `3500000,5`
+- Solo afecta números con decimales reales. Los enteros siempre se muestran sin decimales: `2500000.0` → `2500000`
 
 ## Logs
 
@@ -261,9 +290,13 @@ migracion_YYYYMMDD_HHMMSS.log
 
 FASE 1: CONVERSIÓN XLSX → CSV
 --------------------------------------------------------------------------------
+  [OK] Filas omitidas: [1] (1 filas eliminadas)
+  [OK] Columnas renombradas según esquema (96 columnas)
+  [OK] Fechas convertidas a YYYYMMDD (2 columnas)
+  [OK] Valores numéricos formateados
   [OK] CPQMIGPN.xlsx → CPQMIGPN.csv (150 filas, 96 columnas)
 
-FASE 2: VALIDACIÓN Y PROCESAMIENTO CSV
+FASE 2: PROCESAMIENTO CSV
 --------------------------------------------------------------------------------
 ARCHIVO: CPQMIGPN.csv
 [OK] Validación de columnas exitosa
@@ -300,6 +333,3 @@ Archivos subidos: 1
 
 **Solución:** Verificar variables de entorno FTP y conectividad de red.
 
-## Licencia
-
-Uso interno - Taylor & Johnson

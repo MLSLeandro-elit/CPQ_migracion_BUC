@@ -50,6 +50,7 @@ class ProcessConfig:
     archivo_esquemas: str = os.getenv('ARCHIVO_ESQUEMAS', 'config/esquemas.json')
     archivo_reemplazos: str = os.getenv('ARCHIVO_REEMPLAZOS', 'config/reemplazos.json')
     separador_salida: str = os.getenv('SEPARADOR_SALIDA', '|')
+    separador_decimal: str = os.getenv('SEPARADOR_DECIMAL', '.')
     conservar_entrada: bool = os.getenv('CONSERVAR_ENTRADA', 'false').lower() == 'true'
 
     def cargar_reemplazos(self) -> List[Tuple[str, str]]:
@@ -371,12 +372,13 @@ class IUploader(ABC):
 class ExcelConverter:
     """Convierte archivos Excel (.xlsx) a CSV con renombrado de columnas y fechas numéricas."""
 
-    def __init__(self, schema_loader: SchemaLoader, separador: str = ';'):
+    def __init__(self, schema_loader: SchemaLoader, separador: str = ';', separador_decimal: str = '.'):
         self.schema_loader = schema_loader
         self.separador = separador
+        self.separador_decimal = separador_decimal
 
     def _formatear_entero(self, valor) -> str:
-        """Convierte floats que son enteros a string sin .0"""
+        """Convierte floats que son enteros a string sin .0, usando separador decimal configurado"""
         if pd.isna(valor):
             return ''
         
@@ -384,9 +386,29 @@ class ExcelConverter:
         if isinstance(valor, float):
             if valor == int(valor):
                 return str(int(valor))
-            return str(valor)
+            # Tiene decimales reales, usar separador configurado
+            resultado = str(valor)
+            if self.separador_decimal == ',':
+                resultado = resultado.replace('.', ',')
+            return resultado
         
-        return str(valor) if not isinstance(valor, str) else valor
+        # Si es string, verificar si parece número con .0
+        if isinstance(valor, str):
+            valor_limpio = valor.strip()
+            # Intentar detectar si es un número
+            try:
+                num = float(valor_limpio)
+                if num == int(num):
+                    return str(int(num))
+                # Tiene decimales reales
+                if self.separador_decimal == ',':
+                    return valor_limpio.replace('.', ',')
+                return valor_limpio
+            except ValueError:
+                # No es un número, retornar como está
+                return valor
+        
+        return str(valor)
 
     def _formatear_fecha_numerica(self, valor) -> str:
         """Convierte un valor de fecha a formato YYYYMMDD"""
@@ -425,11 +447,92 @@ class ExcelConverter:
         
         return str(valor)
 
+    def _procesar_dataframe(self, df: pd.DataFrame, nombre: str, logger: MigrationLogger) -> Tuple[bool, pd.DataFrame]:
+        """
+        Aplica transformaciones al DataFrame: filas_omitir, renombrar columnas, fechas, enteros.
+        
+        Returns:
+            Tupla (exitoso, dataframe_procesado)
+        """
+        # Obtener tipo de archivo y esquema
+        tipo_archivo = self.schema_loader.obtener_tipo_archivo(nombre)
+        filas_omitir = []
+        
+        if tipo_archivo:
+            filas_omitir = self.schema_loader.obtener_filas_omitir(tipo_archivo)
+        
+        # Eliminar filas a omitir PRIMERO (numeración desde 1, índice desde 0)
+        if filas_omitir:
+            indices_a_eliminar = [f - 1 for f in filas_omitir]  # Fila 1 = índice 0
+            indices_validos = [i for i in indices_a_eliminar if 0 <= i < len(df)]
+            
+            if indices_validos:
+                df = df.drop(df.index[indices_validos]).reset_index(drop=True)
+                logger.log(f"  [OK] Filas omitidas: {filas_omitir} ({len(indices_validos)} filas eliminadas)")
+
+        # Ahora la primera fila es el encabezado
+        df.columns = df.iloc[0]  # Primera fila como nombres de columnas
+        df = df.iloc[1:].reset_index(drop=True)  # Resto como datos
+
+        if tipo_archivo:
+            columnas_esquema = self.schema_loader.columnas_obligatorias(tipo_archivo)
+            fechas_numericas = self.schema_loader.obtener_fechas_numericas(tipo_archivo)
+            tiene_comodin = self.schema_loader.tiene_comodin(tipo_archivo)
+
+            # Validar cantidad de columnas
+            num_columnas_archivo = len(df.columns)
+            num_columnas_esquema = len(columnas_esquema)
+
+            if tiene_comodin:
+                if num_columnas_archivo < num_columnas_esquema:
+                    logger.log(f"  [ERROR] {nombre}: Columnas insuficientes")
+                    logger.log(f"          Archivo tiene {num_columnas_archivo}, esquema requiere mínimo {num_columnas_esquema}")
+                    return False, df
+            else:
+                if num_columnas_archivo != num_columnas_esquema:
+                    logger.log(f"  [ERROR] {nombre}: Cantidad de columnas no coincide")
+                    logger.log(f"          Archivo tiene {num_columnas_archivo}, esquema requiere {num_columnas_esquema}")
+                    return False, df
+
+            # Renombrar columnas por posición
+            nuevos_nombres = []
+            for i in range(num_columnas_archivo):
+                if i < num_columnas_esquema:
+                    nuevos_nombres.append(columnas_esquema[i])
+                else:
+                    # Columnas extra (después del comodín) - mantener nombre original
+                    nuevos_nombres.append(df.columns[i])
+
+            df.columns = nuevos_nombres
+            logger.log(f"  [OK] Columnas renombradas según esquema ({num_columnas_esquema} columnas)")
+
+            # Convertir fechas numéricas
+            if fechas_numericas:
+                fechas_convertidas = 0
+                for col in fechas_numericas:
+                    if col in df.columns:
+                        df[col] = df[col].apply(self._formatear_fecha_numerica)
+                        fechas_convertidas += 1
+                if fechas_convertidas > 0:
+                    logger.log(f"  [OK] Fechas convertidas a YYYYMMDD ({fechas_convertidas} columnas)")
+
+            # Quitar .0 de columnas numéricas (que no son fechas)
+            columnas_no_fecha = [col for col in df.columns if col not in fechas_numericas]
+            for col in columnas_no_fecha:
+                df[col] = df[col].apply(self._formatear_entero)
+            logger.log(f"  [OK] Valores numéricos formateados")
+
+        else:
+            logger.log(f"  [WARN] {nombre}: Sin esquema definido, usando nombres originales")
+            # Quitar .0 de columnas numéricas aunque no haya esquema
+            for col in df.columns:
+                df[col] = df[col].apply(self._formatear_entero)
+
+        return True, df
+
     def convertir(self, ruta_xlsx: str, ruta_csv: str, logger: MigrationLogger) -> bool:
         """
         Convierte un archivo XLSX a CSV.
-        - Renombra columnas según esquema (por posición)
-        - Convierte fechas numéricas a formato YYYYMMDD
         
         Returns:
             True si la conversión fue exitosa
@@ -437,13 +540,6 @@ class ExcelConverter:
         nombre = os.path.basename(ruta_xlsx)
 
         try:
-            # Obtener tipo de archivo y esquema ANTES de leer
-            tipo_archivo = self.schema_loader.obtener_tipo_archivo(nombre)
-            filas_omitir = []
-            
-            if tipo_archivo:
-                filas_omitir = self.schema_loader.obtener_filas_omitir(tipo_archivo)
-            
             # Leer Excel SIN header (todas las filas como datos)
             df = pd.read_excel(ruta_xlsx, engine='openpyxl', header=None)
 
@@ -451,72 +547,10 @@ class ExcelConverter:
                 logger.log(f"  [ERROR] Archivo vacío: {nombre}")
                 return False
 
-            # Eliminar filas a omitir PRIMERO (numeración desde 1, índice desde 0)
-            if filas_omitir:
-                indices_a_eliminar = [f - 1 for f in filas_omitir]  # Fila 1 = índice 0
-                indices_validos = [i for i in indices_a_eliminar if 0 <= i < len(df)]
-                
-                if indices_validos:
-                    df = df.drop(df.index[indices_validos]).reset_index(drop=True)
-                    logger.log(f"  [OK] Filas omitidas: {filas_omitir} ({len(indices_validos)} filas eliminadas)")
-
-            # Ahora la primera fila es el encabezado
-            df.columns = df.iloc[0]  # Primera fila como nombres de columnas
-            df = df.iloc[1:].reset_index(drop=True)  # Resto como datos
-
-            if tipo_archivo:
-                columnas_esquema = self.schema_loader.columnas_obligatorias(tipo_archivo)
-                fechas_numericas = self.schema_loader.obtener_fechas_numericas(tipo_archivo)
-                tiene_comodin = self.schema_loader.tiene_comodin(tipo_archivo)
-
-                # Validar cantidad de columnas
-                num_columnas_excel = len(df.columns)
-                num_columnas_esquema = len(columnas_esquema)
-
-                if tiene_comodin:
-                    if num_columnas_excel < num_columnas_esquema:
-                        logger.log(f"  [ERROR] {nombre}: Columnas insuficientes")
-                        logger.log(f"          Excel tiene {num_columnas_excel}, esquema requiere mínimo {num_columnas_esquema}")
-                        return False
-                else:
-                    if num_columnas_excel != num_columnas_esquema:
-                        logger.log(f"  [ERROR] {nombre}: Cantidad de columnas no coincide")
-                        logger.log(f"          Excel tiene {num_columnas_excel}, esquema requiere {num_columnas_esquema}")
-                        return False
-
-                # Renombrar columnas por posición
-                nuevos_nombres = []
-                for i in range(num_columnas_excel):
-                    if i < num_columnas_esquema:
-                        nuevos_nombres.append(columnas_esquema[i])
-                    else:
-                        # Columnas extra (después del comodín) - mantener nombre original
-                        nuevos_nombres.append(df.columns[i])
-
-                df.columns = nuevos_nombres
-                logger.log(f"  [OK] Columnas renombradas según esquema ({num_columnas_esquema} columnas)")
-
-                # Convertir fechas numéricas
-                if fechas_numericas:
-                    fechas_convertidas = 0
-                    for col in fechas_numericas:
-                        if col in df.columns:
-                            df[col] = df[col].apply(self._formatear_fecha_numerica)
-                            fechas_convertidas += 1
-                    if fechas_convertidas > 0:
-                        logger.log(f"  [OK] Fechas convertidas a YYYYMMDD ({fechas_convertidas} columnas)")
-
-                # Quitar .0 de columnas numéricas (que no son fechas)
-                columnas_no_fecha = [col for col in df.columns if col not in fechas_numericas]
-                for col in columnas_no_fecha:
-                    df[col] = df[col].apply(self._formatear_entero)
-                logger.log(f"  [OK] Valores numéricos formateados (sin .0)")
-
-            else:
-                logger.log(f"  [WARN] {nombre}: Sin esquema definido, usando nombres originales")
-                # Quitar .0 de columnas numéricas aunque no haya esquema
-                for col in df.columns:
-                    df[col] = df[col].apply(self._formatear_entero)
+            # Procesar DataFrame
+            exitoso, df = self._procesar_dataframe(df, nombre, logger)
+            if not exitoso:
+                return False
 
             # Guardar CSV
             df.to_csv(ruta_csv, sep=self.separador, index=False, encoding='utf-8')
@@ -524,6 +558,43 @@ class ExcelConverter:
             filas = len(df)
             columnas = len(df.columns)
             logger.log(f"  [OK] {nombre} → {os.path.basename(ruta_csv)} ({filas} filas, {columnas} columnas)")
+
+            return True
+
+        except Exception as e:
+            logger.log(f"  [ERROR] {nombre}: {str(e)}")
+            return False
+
+    def convertir_csv(self, ruta_csv_entrada: str, ruta_csv_salida: str, 
+                      separador_entrada: str, logger: MigrationLogger) -> bool:
+        """
+        Procesa un archivo CSV aplicando las mismas transformaciones que a XLSX.
+        
+        Returns:
+            True si el procesamiento fue exitoso
+        """
+        nombre = os.path.basename(ruta_csv_entrada)
+
+        try:
+            # Leer CSV SIN header (todas las filas como datos)
+            df = pd.read_csv(ruta_csv_entrada, sep=separador_entrada, header=None, 
+                            encoding='utf-8', dtype=str, keep_default_na=False)
+
+            if df.empty:
+                logger.log(f"  [ERROR] Archivo vacío: {nombre}")
+                return False
+
+            # Procesar DataFrame
+            exitoso, df = self._procesar_dataframe(df, nombre, logger)
+            if not exitoso:
+                return False
+
+            # Guardar CSV con separador de salida
+            df.to_csv(ruta_csv_salida, sep=self.separador, index=False, encoding='utf-8')
+
+            filas = len(df)
+            columnas = len(df.columns)
+            logger.log(f"  [OK] {nombre} procesado ({filas} filas, {columnas} columnas)")
 
             return True
 
@@ -573,6 +644,47 @@ class ExcelConverter:
 
         logger.fin_conversion()
         return archivos_csv, archivos_xlsx_exitosos
+
+    def convertir_carpeta_csv(self, carpeta_entrada: str, carpeta_salida: str,
+                              separador_entrada: str, logger: MigrationLogger) -> Tuple[List[str], List[str]]:
+        """
+        Procesa todos los archivos CSV de una carpeta.
+        
+        Returns:
+            Tupla (archivos_procesados, archivos_csv_exitosos)
+        """
+        logger.inicio_conversion()
+
+        os.makedirs(carpeta_salida, exist_ok=True)
+
+        archivos_csv = [f for f in os.listdir(carpeta_entrada)
+                        if f.lower().endswith('.csv')]
+
+        if not archivos_csv:
+            logger.log("[INFO] No hay archivos .csv en entrada_csv/")
+            logger.fin_conversion()
+            return [], []
+
+        logger.log(f"[INFO] Encontrados {len(archivos_csv)} archivos .csv")
+        logger.log("")
+
+        archivos_salida = []
+        archivos_csv_exitosos = []
+
+        for archivo_csv in archivos_csv:
+            ruta_entrada = os.path.join(carpeta_entrada, archivo_csv)
+            ruta_salida = os.path.join(carpeta_salida, archivo_csv)
+
+            if self.convertir_csv(ruta_entrada, ruta_salida, separador_entrada, logger):
+                archivos_salida.append(archivo_csv)
+                archivos_csv_exitosos.append(archivo_csv)
+                logger.archivos_convertidos.append(archivo_csv)
+            else:
+                logger.archivos_conversion_error.append(archivo_csv)
+                logger.log(f"       {archivo_csv} permanece en entrada_csv/ (revisar error)")
+
+        logger.fin_conversion()
+        return archivos_salida, archivos_csv_exitosos
 
 
 # =============================================================================
@@ -1047,12 +1159,16 @@ class MigrationOrchestrator:
         # Solicitar tipo de entrada
         self.tipo_entrada = self.solicitar_tipo_entrada()
 
-        # Solicitar separador
-        self.separador_csv = self.solicitar_separador()
+        # Solicitar separador solo si es CSV
+        if self.tipo_entrada == 'csv':
+            self.separador_csv = self.solicitar_separador()
+            self.validator.separador = self.separador_csv
+        else:
+            # Para XLSX, usar punto y coma por defecto (separador interno)
+            self.separador_csv = ';'
 
         # Actualizar separador en componentes
         self.excel_converter.separador = self.separador_csv
-        self.validator.separador = self.separador_csv
 
         # Determinar carpeta de entrada según selección
         if self.tipo_entrada == 'xlsx':
@@ -1064,8 +1180,10 @@ class MigrationOrchestrator:
         print(f"  - Tipo de entrada: {self.tipo_entrada.upper()}")
         print(f"  - Carpeta entrada: {carpeta_entrada}/")
         print(f"  - Carpeta salida: {self.process_config.carpeta_salida}/")
-        print(f"  - Separador CSV: {repr(self.separador_csv)}")
+        if self.tipo_entrada == 'csv':
+            print(f"  - Separador CSV entrada: {repr(self.separador_csv)}")
         print(f"  - Separador salida: {repr(self.process_config.separador_salida)}")
+        print(f"  - Separador decimal: {repr(self.process_config.separador_decimal)}")
         print(f"  - Conservar entrada: {'Sí' if self.process_config.conservar_entrada else 'No'}")
         print()
 
@@ -1075,7 +1193,7 @@ class MigrationOrchestrator:
         archivos_a_eliminar = []
 
         if self.tipo_entrada == 'xlsx':
-            # 2a. Convertir XLSX → CSV
+            # 2a. Convertir XLSX → CSV temporal
             archivos_csv, archivos_xlsx_exitosos = self.excel_converter.convertir_carpeta(
                 carpeta_entrada, self.carpeta_temporal, self.logger
             )
@@ -1086,33 +1204,31 @@ class MigrationOrchestrator:
                 csv_name = xlsx.rsplit('.', 1)[0] + '.csv'
                 archivos_origen[csv_name] = os.path.join(carpeta_entrada, xlsx)
 
-            # 3. Procesar archivos CSV
+            # 3. Procesar archivos CSV (reemplazos de caracteres y cambio separador)
             if archivos_csv:
                 archivos_a_eliminar = self.procesar_archivos_csv(
                     self.carpeta_temporal, archivos_origen
                 )
 
         else:
-            # 2b. Copiar CSV a carpeta temporal para procesar
-            archivos_csv = [f for f in os.listdir(carpeta_entrada)
-                            if f.lower().endswith('.csv')]
+            # 2b. Procesar CSV directamente con pandas
+            self.excel_converter.separador = self.process_config.separador_salida
+            
+            archivos_procesados, archivos_csv_exitosos = self.excel_converter.convertir_carpeta_csv(
+                carpeta_entrada, 
+                self.process_config.carpeta_salida,
+                self.separador_csv,
+                self.logger
+            )
 
-            if archivos_csv:
-                os.makedirs(self.carpeta_temporal, exist_ok=True)
-
-                archivos_origen = {}
-                for csv_file in archivos_csv:
-                    src = os.path.join(carpeta_entrada, csv_file)
-                    dst = os.path.join(self.carpeta_temporal, csv_file)
-                    shutil.copy2(src, dst)
-                    archivos_origen[csv_file] = src
-
-                # 3. Procesar archivos CSV
-                archivos_a_eliminar = self.procesar_archivos_csv(
-                    self.carpeta_temporal, archivos_origen
-                )
-            else:
-                self.logger.log(f"[INFO] No hay archivos .csv en {carpeta_entrada}/")
+            # Mapear archivos procesados a origen
+            archivos_a_eliminar = [
+                os.path.join(carpeta_entrada, csv) for csv in archivos_csv_exitosos
+            ]
+            
+            # Registrar en logger
+            for archivo in archivos_procesados:
+                self.logger.archivos_procesados.append(archivo)
 
         # 4. Limpiar carpeta temporal
         self.limpiar_temporal()
@@ -1172,7 +1288,11 @@ def main():
     schema_loader = SchemaLoader(process_config.archivo_esquemas)
 
     # Crear implementaciones
-    excel_converter = ExcelConverter(schema_loader=schema_loader, separador=';')
+    excel_converter = ExcelConverter(
+        schema_loader=schema_loader,
+        separador=';',
+        separador_decimal=process_config.separador_decimal
+    )
 
     validator = ColumnValidator(
         schema_loader=schema_loader,
