@@ -9,6 +9,7 @@ logs/
 entrada_csv/
 entrada_xlsx/
 salida/
+salida_ant/
 
 
 # Versiones antiguas y temporales

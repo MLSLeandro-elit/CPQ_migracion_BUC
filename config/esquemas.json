@@ -1,5 +1,6 @@
 {
   "CPQMIGPN": {
+    "fila_nombres_columna": 2,
     "filas_omitir": [1, 3],
     "columnas": [
       "FECING",
@@ -109,6 +110,7 @@
     ]
   },
   "CPQMIGPJ": {
+    "fila_nombres_columna": 2,
     "filas_omitir": [1, 3],
     "columnas": [
       "FECING",
@@ -180,6 +182,7 @@
     ]
   },
   "HOMOBENEF": {
+    "fila_nombres_columna": 2,
     "filas_omitir": [1, 3],
     "columnas": [
       "NITCLI",
@@ -199,6 +202,7 @@
     ]
   },
   "HOMOROLESF": {
+    "fila_nombres_columna": 1,
     "filas_omitir": [2],
     "columnas": [
       "TIPCLI",
