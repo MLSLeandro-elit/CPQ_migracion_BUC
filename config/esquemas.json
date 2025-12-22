@@ -216,5 +216,26 @@
       "ROL"
     ],
     "fechas_numericas": []
+  },
+  "OTROSCONVE": {
+  "columnas": [
+    "NITCLI",
+    "TIPEVE",
+    "NROSER",
+    "FECINI_VIG",
+    "FECFIN_VIG",
+    "FEC_PROX_PAG",
+    "SALDO",
+    "PLA_PACTADO",
+    "VAL_CUO",
+    "CUO_PEND",
+    "FEC_CORTE"
+  ],
+  "fechas_numericas": [
+    "FECINI_VIG",
+    "FECFIN_VIG",
+    "FEC_PROX_PAG",
+    "FEC_CORTE"
+  ]
   }
 }
