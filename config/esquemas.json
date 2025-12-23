@@ -237,5 +237,39 @@
     "FEC_PROX_PAG",
     "FEC_CORTE"
   ]
+  },
+  "FUNERARIOS": {
+    "columnas": [
+      "NITCLI",
+      "TIPO_EVENTO",
+      "NOMBRE_EVENTO",
+      "CODIGO_EVENTO",
+      "FECHA_INICIO",
+      "FECHA_FIN",
+      "FECHA_PAGO",
+      "SALDO_SERVICIO",
+      "PERIODICIDAD_PAGO",
+      "FEC_HISTORICO",
+      "ESTADO ASOCIADO"
+    ],
+    "fechas_numericas": [
+      "FECHA_INICIO",
+      "FECHA_FIN",
+      "FECHA_PAGO",
+      "FEC_HISTORICO"
+    ]
+  },
+  "CLICTATRN": {
+    "fila_nombres_columna": 1,
+    "filas_omitir": [2],
+    "columnas": [
+      "NITCLI",
+      "AGCVIN", 
+      "ASOCOR", 
+      "CTAORI", 
+      "CTADES", 
+      "PRODUC"
+    ],
+    "fechas_numericas": ["ASOCOR"]
   }
 }
